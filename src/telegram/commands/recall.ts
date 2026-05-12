@@ -1,6 +1,7 @@
 import type { TgHandlerContext } from '../types.js';
 import { sentMsgStore } from '../../store/index.js';
 import { config } from '../../config.js';
+import { runZaloRequest } from '../../zalo/rate-limit.js';
 
 type RecallPayload = { msgId: string | number; cliMsgId: string | number };
 
@@ -48,7 +49,10 @@ export function registerRecallCommand({ bot, getApi }: TgHandlerContext): void {
 
     for (const payload of payloads) {
       try {
-        await api.undo(payload, sent.zaloId, zaloThreadType);
+        await runZaloRequest(
+          { label: `undo(${sent.zaloId})`, priority: 'high' },
+          () => api.undo(payload, sent.zaloId, zaloThreadType),
+        );
         console.log(`[TG→Zalo] Recall msgId=${payload.msgId} cliMsgId=${payload.cliMsgId} zaloId=${sent.zaloId}`);
         await ctx.reply('Đã thu hồi tin nhắn trên Zalo.');
         return;

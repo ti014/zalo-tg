@@ -2,6 +2,7 @@ import type { TgHandlerContext } from '../types.js';
 import { groupsCache } from '../../store/index.js';
 import { config } from '../../config.js';
 import { escapeHtml } from '../../utils/format.js';
+import { runZaloRequest } from '../../zalo/rate-limit.js';
 
 export function registerJoingroupCommand({ bot, getApi }: TgHandlerContext): void {
   bot.command('joingroup', async (ctx) => {
@@ -29,14 +30,20 @@ export function registerJoingroupCommand({ bot, getApi }: TgHandlerContext): voi
     }
 
     try {
-      const linkInfo = await currentApi.getGroupLinkInfo(link) as {
+      const linkInfo = await runZaloRequest(
+        { label: 'getGroupLinkInfo()', priority: 'low', maxRetries: 0 },
+        () => currentApi.getGroupLinkInfo(link),
+      ) as {
         groupInfo?: { name?: string; totalMember?: number };
       } | undefined;
 
       const groupName = linkInfo?.groupInfo?.name;
       const totalMember = linkInfo?.groupInfo?.totalMember;
 
-      await currentApi.joinGroupLink(link);
+      await runZaloRequest(
+        { label: 'joinGroupLink()', priority: 'high' },
+        () => currentApi.joinGroupLink(link),
+      );
 
       const memberText = totalMember ? ` (${totalMember} TV)` : '';
       await ctx.telegram.sendMessage(

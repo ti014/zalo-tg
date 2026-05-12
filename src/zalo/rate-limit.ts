@@ -7,6 +7,9 @@ const LOW_PRIORITY_RETRY_DELAY_MS = 120_000;
 
 let queue: Promise<void> = Promise.resolve();
 let nextAllowedAt = 0;
+let queuedRequests = 0;
+let activeRequests = 0;
+let lastRateLimit: { at: number; label: string } | null = null;
 
 export interface ZaloRequestOptions {
   label: string;
@@ -25,7 +28,24 @@ function sleep(ms: number): Promise<void> {
 }
 
 function enqueue<T>(task: () => Promise<T>): Promise<T> {
-  const run = queue.then(task, task);
+  queuedRequests += 1;
+  const run = queue.then(async () => {
+    queuedRequests = Math.max(0, queuedRequests - 1);
+    activeRequests += 1;
+    try {
+      return await task();
+    } finally {
+      activeRequests = Math.max(0, activeRequests - 1);
+    }
+  }, async () => {
+    queuedRequests = Math.max(0, queuedRequests - 1);
+    activeRequests += 1;
+    try {
+      return await task();
+    } finally {
+      activeRequests = Math.max(0, activeRequests - 1);
+    }
+  });
   queue = run.then(() => undefined, () => undefined);
   return run;
 }
@@ -35,6 +55,22 @@ async function waitForTurn(minIntervalMs: number): Promise<void> {
   const waitMs = Math.max(0, nextAllowedAt - now);
   if (waitMs > 0) await sleep(waitMs);
   nextAllowedAt = Date.now() + minIntervalMs;
+}
+
+export interface ZaloRateLimitStatus {
+  queueLength: number;
+  activeRequests: number;
+  cooldownUntil: number | null;
+  lastRateLimit: { at: number; label: string } | null;
+}
+
+export function getZaloRateLimitStatus(now = Date.now()): ZaloRateLimitStatus {
+  return {
+    queueLength: queuedRequests,
+    activeRequests,
+    cooldownUntil: nextAllowedAt > now ? nextAllowedAt : null,
+    lastRateLimit,
+  };
 }
 
 export async function runZaloRequest<T>(
@@ -59,6 +95,7 @@ export async function runZaloRequest<T>(
       } catch (err) {
         if (!isZaloRateLimitError(err)) throw err;
 
+        lastRateLimit = { at: Date.now(), label: options.label };
         nextAllowedAt = Math.max(nextAllowedAt, Date.now() + retryDelayMs);
         if (attempt >= maxRetries) throw err;
 

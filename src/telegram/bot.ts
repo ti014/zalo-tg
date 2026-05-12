@@ -9,6 +9,7 @@ export const BOT_COMMANDS = [
   { command: 'menu',   description: 'Mở bảng điều khiển' },
   { command: 'search', description: 'Tìm bạn bè hoặc nhóm Zalo' },
   { command: 'login',  description: 'Đăng nhập Zalo bằng QR' },
+  { command: 'backup', description: 'Backup topic map/state' },
   { command: 'help',   description: 'Xem hướng dẫn' },
 ];
 

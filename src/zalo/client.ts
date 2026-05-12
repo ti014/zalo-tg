@@ -15,6 +15,7 @@ mkdirSync(QR_TMP_DIR, { recursive: true });
 const QR_IMAGE_PATH = path.join(QR_TMP_DIR, 'zalo-qr.png');
 
 let _api: ZaloAPI | null = null;
+let _apiPromise: Promise<ZaloAPI> | null = null;
 
 // ── imageMetadataGetter ───────────────────────────────────────────────────────
 // Required by zca-js for uploadAttachment (images/GIFs).
@@ -148,26 +149,35 @@ async function runQRLogin(
  */
 export async function getZaloApi(): Promise<ZaloAPI> {
   if (_api) return _api;
+  if (_apiPromise) return _apiPromise;
 
-  if (!existsSync(config.zalo.credentialsPath)) {
-    throw new Error('Chưa có file credentials.json — hãy gửi /login trong Telegram để đăng nhập lần đầu.');
+  _apiPromise = (async () => {
+    if (!existsSync(config.zalo.credentialsPath)) {
+      throw new Error('Chưa có file credentials.json — hãy gửi /login trong Telegram để đăng nhập lần đầu.');
+    }
+
+    const zalo = new Zalo(ZALO_OPTIONS);
+
+    const credentials = JSON.parse(
+      readFileSync(config.zalo.credentialsPath, 'utf8'),
+    ) as { imei: string; cookie: unknown; userAgent: string };
+
+    console.log('[Zalo] Đang đăng nhập bằng credentials đã lưu...');
+    _api = (await zalo.login(credentials as Parameters<typeof zalo.login>[0])) as ZaloAPI;
+    console.log('[Zalo] Đăng nhập thành công ✓');
+    return _api as ZaloAPI;
+  })();
+
+  try {
+    return await _apiPromise;
+  } finally {
+    _apiPromise = null;
   }
-
-  const zalo = new Zalo(ZALO_OPTIONS);
-
-  const credentials = JSON.parse(
-    readFileSync(config.zalo.credentialsPath, 'utf8'),
-  ) as { imei: string; cookie: unknown; userAgent: string };
-
-  console.log('[Zalo] Đang đăng nhập bằng credentials đã lưu...');
-  _api = (await zalo.login(credentials as Parameters<typeof zalo.login>[0])) as ZaloAPI;
-  console.log('[Zalo] Đăng nhập thành công ✓');
-
-  return _api as ZaloAPI;
 }
 
 export function resetZaloApi(): void {
   _api = null;
+  _apiPromise = null;
 }
 
 /**
@@ -176,8 +186,13 @@ export function resetZaloApi(): void {
  * Accepts optional hooks so the caller can forward QR images / status updates.
  */
 export async function triggerQRLogin(hooks: QRLoginHooks = {}): Promise<ZaloAPI> {
-  _api = null;
+  resetZaloApi();
   const zalo = new Zalo(ZALO_OPTIONS);
-  _api = await runQRLogin(zalo, hooks);
-  return _api;
+  _apiPromise = runQRLogin(zalo, hooks);
+  try {
+    _api = await _apiPromise;
+    return _api;
+  } finally {
+    _apiPromise = null;
+  }
 }

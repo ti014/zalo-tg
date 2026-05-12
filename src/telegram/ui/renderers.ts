@@ -14,6 +14,7 @@ export interface StatusViewModel extends MenuViewModel {
   accountName?: string;
   detailed: boolean;
   generatedAt: string;
+  rateLimitInfo?: string;
 }
 
 function connectionLabel(connected: boolean): string {
@@ -61,7 +62,8 @@ export function renderStatus(model: StatusViewModel): string {
     `<b>Dữ liệu</b>\n` +
     `Topic: <b>${model.topicCount}</b>\n` +
     `Nhóm: <b>${model.groupCount}</b>\n` +
-    `Chat riêng: <b>${model.dmCount}</b>`;
+    `Chat riêng: <b>${model.dmCount}</b>` +
+    (model.rateLimitInfo ? `\n\n<b>Rate limit</b>\n<code>${escapeHtml(model.rateLimitInfo)}</code>` : '');
 }
 
 export function renderSettings(settings: { compactMode: boolean; statusDetails: boolean; topicActions: boolean }): string {
@@ -90,7 +92,9 @@ export function renderHelp(): string {
     `  Cách dùng: reply vào đúng tin mình đã gửi từ Telegram sang Zalo, rồi gõ /recall.\n` +
     `/members - xem thành viên nhóm Zalo cho topic hiện tại\n` +
     `/kick &lt;uid|tên&gt; - kick thành viên Zalo (owner)\n` +
-    `/backup - xuất backup topic và cài đặt\n` +
+    `/backup - xuất topic map và cài đặt\n` +
+    `/backup state - xuất topic map, cài đặt, msg-map\n` +
+    `/backup full - xuất full state kèm secret (owner only)\n` +
     `/restore - reply vào file backup để khôi phục`;
 }
 

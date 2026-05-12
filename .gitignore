@@ -12,6 +12,7 @@ credentials.json
 # Dữ liệu runtime
 data/topics.json
 data/*.json
+data/*.lock
 tmp/
 
 # Logs

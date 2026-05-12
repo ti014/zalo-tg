@@ -76,24 +76,28 @@ function _pruneSent(): void {
   }
 }
 
+function _persistMsgMap(): void {
+  try {
+    mkdirSync(path.dirname(_msgMapFile), { recursive: true });
+    const data: MsgMapData = {
+      pairs:  _msgKeyOrder.map(k => [k, _zaloToTg.get(k)!] as [string, number]),
+      quotes: [..._tgToQuote.entries()],
+      sent:   _sentOrder.flatMap(tgMsgId => {
+        const info = _sentMap.get(tgMsgId);
+        return info ? [[tgMsgId, info] as [number, SentMsgInfo]] : [];
+      }),
+    };
+    writeFileSync(_msgMapFile, JSON.stringify(data), 'utf8');
+  } catch (e) {
+    console.warn('[msgStore] Failed to persist msg-map:', e);
+  }
+}
+
 function _scheduleMsgPersist(): void {
   if (_msgPersistTimer) return;
   _msgPersistTimer = setTimeout(() => {
     _msgPersistTimer = null;
-    try {
-      mkdirSync(path.dirname(_msgMapFile), { recursive: true });
-      const data: MsgMapData = {
-        pairs:  _msgKeyOrder.map(k => [k, _zaloToTg.get(k)!] as [string, number]),
-        quotes: [..._tgToQuote.entries()],
-        sent:   _sentOrder.flatMap(tgMsgId => {
-          const info = _sentMap.get(tgMsgId);
-          return info ? [[tgMsgId, info] as [number, SentMsgInfo]] : [];
-        }),
-      };
-      writeFileSync(_msgMapFile, JSON.stringify(data), 'utf8');
-    } catch (e) {
-      console.warn('[msgStore] Failed to persist msg-map:', e);
-    }
+    _persistMsgMap();
   }, 1000);
 }
 
@@ -119,6 +123,14 @@ function _scheduleMsgPersist(): void {
     _indexSent(tgMsgId, info);
   }
   _pruneSent();
+}
+
+export function flushMsgStore(): void {
+  if (_msgPersistTimer) {
+    clearTimeout(_msgPersistTimer);
+    _msgPersistTimer = null;
+  }
+  _persistMsgMap();
 }
 
 export const msgStore = {

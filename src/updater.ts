@@ -53,7 +53,12 @@ function getChangelog(): string {
   }
 }
 
-export function startUpdateChecker(bot: Telegraf): void {
+export interface UpdateCheckerHandle {
+  stop(): void;
+}
+
+export function startUpdateChecker(bot: Telegraf): UpdateCheckerHandle {
+  const timers: Array<ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>> = [];
 
   // ── Periodic check mỗi 10 phút ───────────────────────────────────────────
   const check = async () => {
@@ -83,6 +88,13 @@ export function startUpdateChecker(bot: Telegraf): void {
   };
 
   // Kiểm tra 1 phút sau khi khởi động, sau đó mỗi 10 phút
-  setTimeout(check, 60_000);
-  setInterval(check, 10 * 60_000);
+  timers.push(setTimeout(check, 60_000));
+  timers.push(setInterval(check, 10 * 60_000));
+
+  return {
+    stop(): void {
+      for (const timer of timers) clearTimeout(timer);
+      timers.length = 0;
+    },
+  };
 }

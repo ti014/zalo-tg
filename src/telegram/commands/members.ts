@@ -3,6 +3,7 @@ import { config, isOwner } from '../../config.js';
 import { store, userCache } from '../../store/index.js';
 import { escapeHtml } from '../../utils/format.js';
 import { populateGroupMemberCache } from '../../zalo/helpers.js';
+import { runZaloRequest } from '../../zalo/rate-limit.js';
 
 const MAX_RENDER_MEMBERS = 30;
 
@@ -179,7 +180,10 @@ export function registerKickCommand({ bot, getApi }: TgHandlerContext): void {
     }
 
     try {
-      const response = await api.removeUserFromGroup(memberIds, entry.zaloId) as {
+      const response = await runZaloRequest(
+        { label: `removeUserFromGroup(${entry.zaloId})`, priority: 'high' },
+        () => api.removeUserFromGroup(memberIds, entry.zaloId),
+      ) as {
         errorMembers?: string[];
       };
       const errorMembers = response?.errorMembers ?? [];

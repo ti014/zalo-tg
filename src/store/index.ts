@@ -1,5 +1,5 @@
 export { store, type TopicEntry } from './topics.js';
-export { msgStore, sentMsgStore, type ZaloQuoteData, type SentMsgInfo } from './messages.js';
+export { msgStore, sentMsgStore, flushMsgStore, type ZaloQuoteData, type SentMsgInfo } from './messages.js';
 export { userCache, friendsCache, groupsCache, type ZaloFriend, type ZaloGroup } from './users.js';
 export { aliasCache } from './alias.js';
 export { reactionSummaryStore, reactionEchoStore, type ReactionSummaryEntry } from './reactions.js';

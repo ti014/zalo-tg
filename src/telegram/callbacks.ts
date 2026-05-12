@@ -8,9 +8,13 @@ import { tgBot } from './bot.js';
 import { confirmDeleteTopicKeyboard, helpKeyboard, topicKeyboard } from './ui/keyboards.js';
 import { renderDeleteTopicConfirm, renderHelp, renderTopicCard } from './ui/renderers.js';
 import { buildMenuView, buildSettingsView, buildStatusView, type UiView } from './ui/status.js';
+import { runZaloRequest } from '../zalo/rate-limit.js';
 
 async function doLockPoll(entry: import('../store/index.js').PollEntry, api: ZaloAPI): Promise<void> {
-  await api.lockPoll(entry.pollId);
+  await runZaloRequest(
+    { label: `lockPoll(${entry.pollId})`, priority: 'high' },
+    () => api.lockPoll(entry.pollId),
+  );
   console.log(`[TG→Zalo] Locked Zalo poll ${entry.pollId}`);
   try {
     await tgBot.telegram.stopPoll(config.telegram.groupId, entry.tgPollMsgId);
@@ -21,7 +25,10 @@ async function doLockPoll(entry: import('../store/index.js').PollEntry, api: Zal
     } catch { /* no admin rights or already stopped */ }
   }
   try {
-    const detail = await api.getPollDetail(entry.pollId);
+    const detail = await runZaloRequest(
+      { label: `getPollDetail(${entry.pollId})`, priority: 'low', maxRetries: 0 },
+      () => api.getPollDetail(entry.pollId),
+    ) as { options?: Array<{ content: string; votes: number }>; closed?: boolean } | undefined;
     if (detail?.options) {
       const total = detail.options.reduce((s: number, o: { votes: number }) => s + (o.votes ?? 0), 0);
       const lines = (detail.options as Array<{ content: string; votes: number }>).map(o => {
@@ -191,7 +198,10 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
         return;
       }
       try {
-        await currentApi.leaveGroup(entry.zaloId);
+        await runZaloRequest(
+          { label: `leaveGroup(${entry.zaloId})`, priority: 'high' },
+          () => currentApi.leaveGroup(entry.zaloId),
+        );
         store.remove(topicId);
         groupsCache.set([]);
         await ctx.answerCbQuery('✅ Đã rời nhóm');
@@ -223,7 +233,10 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
 
       try {
         if (action === 'accept') {
-          await currentApi.acceptFriendRequest(fromUid);
+          await runZaloRequest(
+            { label: `acceptFriendRequest(${fromUid})`, priority: 'high' },
+            () => currentApi.acceptFriendRequest(fromUid),
+          );
           await ctx.answerCbQuery('Đã chấp nhận kết bạn');
           await ctx.editMessageReplyMarkup(undefined);
           const previousText = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
@@ -231,7 +244,10 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
             : '';
           await ctx.editMessageText(`${previousText}\n\nĐã chấp nhận`, { parse_mode: 'HTML' }).catch(() => undefined);
         } else {
-          await currentApi.rejectFriendRequest(fromUid);
+          await runZaloRequest(
+            { label: `rejectFriendRequest(${fromUid})`, priority: 'high' },
+            () => currentApi.rejectFriendRequest(fromUid),
+          );
           await ctx.answerCbQuery('Đã từ chối lời mời');
           await ctx.editMessageReplyMarkup(undefined);
           const previousText = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
@@ -250,7 +266,10 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
       const userId = data.slice(3);
       if (!currentApi) { await ctx.answerCbQuery('❌ Zalo chưa kết nối'); return; }
       try {
-        await currentApi.sendFriendRequest('Xin chào! Mình muốn kết bạn với bạn', userId);
+        await runZaloRequest(
+          { label: `sendFriendRequest(${userId})`, priority: 'high' },
+          () => currentApi.sendFriendRequest('Xin chào! Mình muốn kết bạn với bạn', userId),
+        );
         await ctx.answerCbQuery('Đã gửi lời mời kết bạn');
         await ctx.editMessageReplyMarkup(undefined);
       } catch (err) {
@@ -264,7 +283,10 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
       const groupId = data.slice(4);
       if (!currentApi) { await ctx.answerCbQuery('❌ Zalo chưa kết nối'); return; }
       try {
-        await currentApi.joinGroupInviteBox(groupId);
+        await runZaloRequest(
+          { label: `joinGroupInviteBox(${groupId})`, priority: 'high' },
+          () => currentApi.joinGroupInviteBox(groupId),
+        );
         await ctx.answerCbQuery('✅ Đã tham gia nhóm!');
         await ctx.editMessageReplyMarkup(undefined);
         groupsCache.set([]);

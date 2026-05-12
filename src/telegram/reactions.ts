@@ -1,5 +1,6 @@
 import type { TgHandlerContext } from './types.js';
 import { msgStore, reactionEchoStore } from '../store/index.js';
+import { runZaloRequest } from '../zalo/rate-limit.js';
 
 export function registerReactionHandler({ bot, getApi }: TgHandlerContext): void {
   bot.on('message_reaction', async (ctx) => {
@@ -83,13 +84,16 @@ export function registerReactionHandler({ bot, getApi }: TgHandlerContext): void
 
       reactionEchoStore.mark(quote.zaloId, quote.msgId, zaloIcon);
       try {
-        await currentApi.addReaction(
-          { rType: 0, source: 0, icon: zaloIcon },
-          {
-            data: { msgId: quote.msgId, cliMsgId: quote.cliMsgId },
-            threadId: quote.zaloId,
-            type: zaloThreadType,
-          },
+        await runZaloRequest(
+          { label: `addReaction(${quote.zaloId})`, priority: 'high' },
+          () => currentApi.addReaction(
+            { rType: 0, source: 0, icon: zaloIcon },
+            {
+              data: { msgId: quote.msgId, cliMsgId: quote.cliMsgId },
+              threadId: quote.zaloId,
+              type: zaloThreadType,
+            },
+          ),
         );
       } catch (err) {
         reactionEchoStore.cancel(quote.zaloId, quote.msgId, zaloIcon);

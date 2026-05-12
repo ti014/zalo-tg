@@ -1,5 +1,6 @@
 import type { ZaloAPI } from '../../zalo/types.js';
 import { settingsStore, store } from '../../store/index.js';
+import { getZaloRateLimitStatus } from '../../zalo/rate-limit.js';
 import { menuKeyboard, settingsKeyboard, statusKeyboard, type InlineKeyboardMarkup } from './keyboards.js';
 import { renderMenu, renderSettings, renderStatus, type MenuViewModel, type StatusViewModel } from './renderers.js';
 
@@ -69,12 +70,27 @@ export async function buildStatusView(
   const accountName = detailed
     ? await getAccountName(api, options.forceRefresh ?? false)
     : undefined;
+  let rateLimitLine: string | undefined;
+  if (detailed) {
+    const now = Date.now();
+    const rl = getZaloRateLimitStatus(now);
+    const parts: string[] = [];
+    if (rl.queueLength > 0) parts.push(`queue: ${rl.queueLength}`);
+    if (rl.cooldownUntil) parts.push(`cooldown: ${Math.ceil((rl.cooldownUntil - now) / 1000)}s`);
+    if (rl.lastRateLimit) {
+      const ago = Math.round((now - rl.lastRateLimit.at) / 1000);
+      parts.push(`last 221: ${ago}s ago`);
+    }
+    if (parts.length > 0) rateLimitLine = parts.join(' | ');
+  }
+
   const statusModel: StatusViewModel = {
     ...menuModel,
     uptime: formatUptime(Math.floor((Date.now() - bridgeStartedAt) / 1000)),
     accountName,
     detailed,
     generatedAt: new Date().toLocaleString('vi-VN'),
+    rateLimitInfo: rateLimitLine,
   };
 
   return { text: renderStatus(statusModel), replyMarkup: statusKeyboard() };

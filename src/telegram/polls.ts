@@ -3,6 +3,7 @@ import { pollStore } from '../store/index.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { doLockPoll } from './callbacks.js';
+import { runZaloRequest } from '../zalo/rate-limit.js';
 
 export function registerPollHandlers({ bot, getApi }: TgHandlerContext): void {
   bot.on('poll', async (ctx) => {
@@ -40,7 +41,10 @@ export function registerPollHandlers({ bot, getApi }: TgHandlerContext): void {
 
       const refreshScore = async () => {
         try {
-          const detail = await api.getPollDetail(entry.pollId);
+          const detail = await runZaloRequest(
+            { label: `getPollDetail(${entry.pollId})`, priority: 'low', maxRetries: 0 },
+            () => api.getPollDetail(entry.pollId),
+          ) as { options?: Array<{ content: string; votes: number }>; closed?: boolean } | undefined;
           if (!detail?.options) return;
           const total = detail.options.reduce((s: number, o: { votes: number }) => s + (o.votes ?? 0), 0);
           const lines = (detail.options as Array<{ content: string; votes: number }>).map(o => {
@@ -78,7 +82,10 @@ export function registerPollHandlers({ bot, getApi }: TgHandlerContext): void {
 
       if (optionIds.length === 0) {
         try {
-          await api.votePoll(entry.pollId, []);
+          await runZaloRequest(
+            { label: `votePoll(${entry.pollId})`, priority: 'high' },
+            () => api.votePoll(entry.pollId, []),
+          );
           console.log(`[TG→Zalo] Unvoted poll ${entry.pollId}`);
         } catch (e) {
           console.warn('[TG→Zalo] unvote failed:', e);
@@ -87,7 +94,10 @@ export function registerPollHandlers({ bot, getApi }: TgHandlerContext): void {
         return;
       }
 
-      await api.votePoll(entry.pollId, optionIds.length === 1 ? optionIds[0] : optionIds);
+      await runZaloRequest(
+        { label: `votePoll(${entry.pollId})`, priority: 'high' },
+        () => api.votePoll(entry.pollId, optionIds.length === 1 ? optionIds[0] : optionIds),
+      );
       console.log(`[TG→Zalo] Voted poll ${entry.pollId} options [${optionIds}]`);
 
       await refreshScore();
