@@ -1,0 +1,154 @@
+import { CloseReason } from 'zca-js';
+import { getZaloApi, resetZaloApi } from './zalo/client.js';
+import { setupZaloHandler } from './zalo/handler.js';
+import { tgBot, syncTelegramCommands } from './telegram/bot.js';
+import { setupTelegramHandler } from './telegram/handler.js';
+import { config } from './config.js';
+import { startUpdateChecker } from './updater.js';
+import { store } from './store/index.js';
+
+// ── Global safety net ─────────────────────────────────────────────────────────
+// Log + exit cleanly so a supervisor (PM2/systemd/Docker) can restart the bot.
+// Continuing after these leaves the process in an undefined state — bridge
+// events silently drop while the bot looks healthy.
+process.on('unhandledRejection', (reason) => {
+  console.error('[Boot] Unhandled rejection — exiting:', reason);
+  process.exit(1);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[Boot] Uncaught exception — exiting:', err);
+  process.exit(1);
+});
+
+// ── Module-level ref to Telegram handler's API setter (used by reconnect) ─────
+let setZaloApiRef: ((api: Awaited<ReturnType<typeof getZaloApi>>) => void) | null = null;
+
+// ── Boot Zalo (also used when /login swaps in a fresh API) ───────────────────
+
+async function pruneLeftGroupTopics(api: Awaited<ReturnType<typeof getZaloApi>>): Promise<void> {
+  try {
+    const groups = await api.getAllGroups() as { gridVerMap?: Record<string, string> } | undefined;
+    const activeGroupIds = new Set(Object.keys(groups?.gridVerMap ?? {}));
+    const removed: string[] = [];
+
+    for (const entry of store.all()) {
+      if (entry.type === 1 && !activeGroupIds.has(entry.zaloId)) {
+        store.remove(entry.topicId);
+        removed.push(`${entry.name} (${entry.zaloId})`);
+      }
+    }
+
+    if (removed.length > 0) {
+      console.log(`[Boot] Pruned ${removed.length} stale group topic(s): ${removed.join(', ')}`);
+    }
+  } catch (err) {
+    console.warn('[Boot] Could not prune stale group topics:', err);
+  }
+}
+
+async function startZalo(
+  api: Awaited<ReturnType<typeof getZaloApi>>,
+  isReconnect = false,
+): Promise<void> {
+  if (!isReconnect) void pruneLeftGroupTopics(api);
+  await setupZaloHandler(api);
+  api.listener.start();
+  console.log(`[Boot] Zalo listener ${isReconnect ? 're' : ''}started ✓`);
+
+  api.listener.once('disconnected', (code: CloseReason) => {
+    if ((code as number) === 1000) return;
+
+    console.warn(`[Boot] Zalo disconnected (code=${code}), reconnecting in 5 s...`);
+    tgBot.telegram.sendMessage(
+      config.telegram.groupId,
+      'Zalo bị ngắt kết nối, đang thử kết nối lại...',
+    ).catch(() => undefined);
+
+    setTimeout(() => {
+      void (async () => {
+        try {
+          resetZaloApi();
+          const newApi = await getZaloApi();
+          setZaloApiRef?.(newApi);
+          await startZalo(newApi, true);
+          tgBot.telegram.sendMessage(config.telegram.groupId, 'Zalo đã kết nối lại.').catch(() => undefined);
+          console.log('[Boot] Zalo reconnected ✓');
+        } catch (err) {
+          console.error('[Boot] Zalo reconnect failed:', err);
+          tgBot.telegram.sendMessage(
+            config.telegram.groupId,
+            'Kết nối lại Zalo thất bại. Hãy dùng <b>/login</b> để đăng nhập lại.',
+            { parse_mode: 'HTML' },
+          ).catch(() => undefined);
+        }
+      })();
+    }, 5_000);
+  });
+}
+
+async function main(): Promise<void> {
+  console.log('╔══════════════════════════════════════╗');
+  console.log('║   Zalo ↔ Telegram Bridge  v1.0.0    ║');
+  console.log('╚══════════════════════════════════════╝');
+
+  // ── Auto update checker — must register BEFORE setupTelegramHandler ─────────
+  // bot.action() is middleware; the catch-all on('callback_query') in handler.ts
+  // doesn't call next(), so ua: callbacks must be registered first in the chain.
+  startUpdateChecker(tgBot);
+
+  // ── Wire up Telegram handler BEFORE launching the bot ─────────────────────
+  // setupTelegramHandler returns a setter to inject the Zalo API after auto-login.
+  const setZaloApi = setupTelegramHandler(null, async (newApi) => {
+    await startZalo(newApi, true);
+  });
+  setZaloApiRef = setZaloApi;
+
+  // ── Start Telegram bot so /login can be received immediately ───────────────
+  // NOTE: tgBot.launch() runs the polling loop forever, so we must NOT await it.
+  // The second argument callback fires once getMe() + deleteWebhook() succeed.
+  tgBot.launch({ allowedUpdates: ['message', 'callback_query', 'message_reaction', 'poll_answer', 'poll'] }, () => {
+    console.log('[Boot] Telegram bot started ✓');
+
+    syncTelegramCommands()
+      .then(() => console.log('[Boot] Telegram command menu synced ✓'))
+      .catch((err: unknown) => console.warn('[Boot] Failed to sync Telegram commands:', err));
+
+    // ── Attempt Zalo login in background ────────────────────────────────────
+    // If credentials.json exists → connects automatically and updates currentApi.
+    // If not → notifies the user to run /login.
+    getZaloApi()
+      .then(async (api) => {
+        setZaloApi(api);   // ← inject into Telegram handler so TG→Zalo works
+        await startZalo(api);
+      })
+      .catch((err: unknown) => {
+        console.warn('[Boot] Zalo auto-login failed:', err);
+        tgBot.telegram
+          .sendMessage(
+            config.telegram.groupId,
+            '⚠️ Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
+            { parse_mode: 'HTML' },
+          )
+          .catch(() => undefined);
+      });
+  });
+
+  console.log('[Boot] Bridge is running 🚀  (Ctrl+C to stop)');
+
+  // ── Graceful shutdown ──────────────────────────────────────────────────────
+  const shutdown = (signal: string) => {
+    console.log(`\n[Boot] Received ${signal}, shutting down...`);
+    try { getZaloApi().then(api => api.listener.stop()).catch(() => undefined); } catch { /* ignore */ }
+    tgBot.stop(signal);
+    process.exit(0);
+  };
+
+  process.once('SIGINT',  () => shutdown('SIGINT'));
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+main().catch((err: unknown) => {
+  console.error('[Boot] Fatal error:', err);
+  process.exit(1);
+});
+

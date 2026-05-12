@@ -1,0 +1,27 @@
+[Unit]
+Description=Zalo–Telegram Bridge Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/zalo-tg
+EnvironmentFile=/root/zalo-tg/.env
+
+# Build first, then run compiled JS (tiết kiệm RAM hơn tsx)
+ExecStartPre=/usr/bin/npm run build
+ExecStart=/usr/bin/node dist/index.js
+
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zalo-tg
+
+# Giới hạn nhẹ để không chiếm hết tài nguyên
+MemoryMax=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
