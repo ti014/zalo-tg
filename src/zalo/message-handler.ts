@@ -13,13 +13,8 @@ import {
   buildScoreText,
   getCachedGroupInfo,
   isMutedZaloGroup,
-  canRetryMemberCache,
-  clearMemberCacheRetry,
-  deferMemberCacheRetry,
-  memberCacheLoaded,
   parseBankCardHtml,
   parseContent,
-  populateGroupMemberCache,
   resolveUserDisplayName,
   tg,
 } from './helpers.js';
@@ -79,18 +74,6 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
       if (type === ThreadType.Group && await isMutedZaloGroup(api, zaloId)) {
         console.log(`[Zalo→TG] Skip muted group ${zaloId}`);
         return;
-      }
-
-      if (type === 1 && !memberCacheLoaded.has(zaloId) && canRetryMemberCache(zaloId)) {
-        memberCacheLoaded.add(zaloId);
-        void populateGroupMemberCache(api, zaloId).then(ok => {
-          if (ok) {
-            clearMemberCacheRetry(zaloId);
-            return;
-          }
-          memberCacheLoaded.delete(zaloId);
-          deferMemberCacheRetry(zaloId);
-        });
       }
 
       if (type === ThreadType.Group) {

@@ -1,5 +1,6 @@
 import type { PollOptions } from 'zca-js';
 import type { ZaloAPI, ZaloMediaContent, ZaloGroupInfoResponse } from './types.js';
+import { isZaloRateLimitError, runZaloRequest } from './rate-limit.js';
 import { userCache } from '../store/index.js';
 import { tgBot } from '../telegram/bot.js';
 import { config } from '../config.js';
@@ -44,7 +45,10 @@ export function parseBankCardHtml(html: string): BankCardInfo | null {
 
 export async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<boolean> {
   try {
-    const info = await api.getGroupInfo(groupId) as {
+    const info = await runZaloRequest(
+      { label: `getGroupInfo(${groupId})`, priority: 'low', maxRetries: 0 },
+      () => api.getGroupInfo(groupId),
+    ) as {
       gridInfoMap?: Record<string, {
         memVerList?: string[];
         totalMember?: number;
@@ -64,11 +68,14 @@ export async function populateGroupMemberCache(api: ZaloAPI, groupId: string): P
       return true;
     }
 
-    const BATCH = 50;
+    const batchSize = 20;
     let saved = 0;
-    for (let i = 0; i < uids.length; i += BATCH) {
-      const batch = uids.slice(i, i + BATCH);
-      const resp = await api.getUserInfo(batch) as {
+    for (let i = 0; i < uids.length; i += batchSize) {
+      const batch = uids.slice(i, i + batchSize);
+      const resp = await runZaloRequest(
+        { label: `getUserInfo(${groupId}:${i}-${i + batch.length})`, priority: 'low', maxRetries: 0 },
+        () => api.getUserInfo(batch),
+      ) as {
         changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
         unchanged_profiles?: Record<string, unknown>;
       };
@@ -84,7 +91,11 @@ export async function populateGroupMemberCache(api: ZaloAPI, groupId: string): P
     clearMemberCacheRetry(groupId);
     return true;
   } catch (err) {
-    console.warn(`[Zalo] populateGroupMemberCache failed for ${groupId}:`, err);
+    if (isZaloRateLimitError(err)) {
+      console.warn(`[Zalo] Tạm dừng cache thành viên nhóm ${groupId} do quá giới hạn request.`);
+    } else {
+      console.warn(`[Zalo] populateGroupMemberCache failed for ${groupId}:`, err);
+    }
     deferMemberCacheRetry(groupId);
     return false;
   }
@@ -101,7 +112,10 @@ export async function getCachedGroupInfo(
   const hit = _groupInfoCache.get(zaloId);
   if (hit && Date.now() - hit.ts < GROUP_INFO_TTL) return hit;
   try {
-    const info = await api.getGroupInfo(zaloId) as ZaloGroupInfoResponse;
+    const info = await runZaloRequest(
+      { label: `getCachedGroupInfo(${zaloId})`, priority: 'low', maxRetries: 0 },
+      () => api.getGroupInfo(zaloId),
+    ) as ZaloGroupInfoResponse;
     const entry: GroupInfoEntry = {
       name: info?.gridInfoMap?.[zaloId]?.name ?? '',
       avt:  info?.gridInfoMap?.[zaloId]?.avt,
@@ -141,7 +155,10 @@ export async function isMutedZaloGroup(api: ZaloAPI, groupId: string): Promise<b
   }
 
   try {
-    const muteInfo = await api.getMute() as { groupChatEntries?: ZaloMuteEntry[] };
+    const muteInfo = await runZaloRequest(
+      { label: 'getMute()', priority: 'low', maxRetries: 0 },
+      () => api.getMute(),
+    ) as { groupChatEntries?: ZaloMuteEntry[] };
     const mutedIds = new Set(
       (muteInfo.groupChatEntries ?? [])
         .filter(isActiveMute)
@@ -172,7 +189,10 @@ export async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefin
   if (blockedUntil !== undefined && Date.now() < blockedUntil) return fallbackName;
 
   try {
-    const resp = await api.getUserInfo(cleanUid) as {
+    const resp = await runZaloRequest(
+      { label: `resolveUserDisplayName(${cleanUid})`, priority: 'low', maxRetries: 0 },
+      () => api.getUserInfo(cleanUid),
+    ) as {
       changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
       unchanged_profiles?: Record<string, unknown>;
     };

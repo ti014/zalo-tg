@@ -7,6 +7,17 @@ import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail } from '../utils/media.js';
 import { resolveTgMentions, type TgEntity } from './helpers.js';
+import { runZaloRequest } from '../zalo/rate-limit.js';
+
+interface ZaloSendMessageResult {
+  message?: { msgId?: number } | null;
+  attachment?: Array<{ msgId?: number }>;
+}
+
+interface ZaloCreatePollResult {
+  poll_id?: number;
+  options?: Array<{ option_id?: number; content: string; votes?: number }>;
+}
 
 export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void {
   bot.on('message', async (ctx) => {
@@ -46,6 +57,8 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           hint = threadType === ThreadType.User
             ? '\n💡 <i>Zalo từ chối: chưa kết bạn hoặc người dùng đã bật giới hạn tin nhắn từ người lạ.</i>'
             : '\n💡 <i>Zalo từ chối tham số (code 114).</i>';
+        } else if (code === 221) {
+          hint = '\n<i>Zalo đang giới hạn request. Bot đã retry, nếu vẫn lỗi hãy chờ vài phút rồi gửi lại.</i>';
         } else if (code === -216) {
           hint = '\n💡 <i>Phiên đăng nhập Zalo hết hạn. Dùng /login để đăng nhập lại.</i>';
         }
@@ -58,6 +71,12 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           )
           .catch(() => undefined);
       };
+
+      const sendZalo = <T>(label: string, request: () => Promise<T>, maxRetries = 2): Promise<T> =>
+        runZaloRequest(
+          { label: `${label}(${zaloId})`, priority: 'high', maxRetries },
+          request,
+        );
 
       if ('text' in msg && msg.text) {
         if (msg.text.startsWith('/')) return;
@@ -74,24 +93,30 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
 
         sentMsgStore.markSending(zaloId, msg.message_id);
         try {
-          let sendResult = await api.sendMessage(
-            {
-              msg: msg.text,
-              ...(zaloQuote ? { quote: zaloQuote } : {}),
-              ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
-            },
-            zaloId,
-            threadType,
+          let sendResult = await sendZalo<ZaloSendMessageResult>(
+            'sendMessage',
+            () => api.sendMessage(
+              {
+                msg: msg.text,
+                ...(zaloQuote ? { quote: zaloQuote } : {}),
+                ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
+              },
+              zaloId,
+              threadType,
+            ),
           ).catch(async (err: unknown) => {
             if ((err as { code?: number }).code === 114 && zaloQuote) {
               console.warn('[TG→Zalo] code 114 with quote, retrying without quote');
-              return api.sendMessage(
-                {
-                  msg: msg.text,
-                  ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
-                },
-                zaloId,
-                threadType,
+              return sendZalo<ZaloSendMessageResult>(
+                'sendMessage(no-quote)',
+                () => api.sendMessage(
+                  {
+                    msg: msg.text,
+                    ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
+                  },
+                  zaloId,
+                  threadType,
+                ),
               );
             }
             throw err;
@@ -153,30 +178,36 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
 
           const effectiveCaption = caption ?? '';
 
-          const sendResult = await withTimeout(api.sendMessage(
-            {
-              msg: effectiveCaption,
-              attachments: [localPath],
-              ...(effectiveCaption.length && zaloQuote ? { quote: zaloQuote } : {}),
-              ...(captionMentions?.length ? { mentions: captionMentions } : {}),
-            },
-            zaloId,
-            threadType,
-          )).catch(async (err: unknown) => {
+          const sendResult = await sendZalo<ZaloSendMessageResult>(
+            'sendAttachment',
+            () => withTimeout(api.sendMessage(
+              {
+                msg: effectiveCaption,
+                attachments: [localPath],
+                ...(effectiveCaption.length && zaloQuote ? { quote: zaloQuote } : {}),
+                ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+              },
+              zaloId,
+              threadType,
+            )),
+          ).catch(async (err: unknown) => {
             if ((err as { code?: number }).code === 114) {
               console.warn('[TG→Zalo] code 114 on attachment+quote, retrying without quote');
-              return withTimeout(api.sendMessage(
-                {
-                  msg: effectiveCaption,
-                  attachments: [localPath],
-                  ...(captionMentions?.length ? { mentions: captionMentions } : {}),
-                },
-                zaloId,
-                threadType,
-              ));
+              return sendZalo<ZaloSendMessageResult>(
+                'sendAttachment(no-quote)',
+                () => withTimeout(api.sendMessage(
+                  {
+                    msg: effectiveCaption,
+                    attachments: [localPath],
+                    ...(captionMentions?.length ? { mentions: captionMentions } : {}),
+                  },
+                  zaloId,
+                  threadType,
+                )),
+              );
             }
             throw err;
-          }) as { message?: { msgId?: number } | null; attachment?: Array<{ msgId?: number }> };
+          });
 
           const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
           if (zaloMsgId !== undefined) {
@@ -220,15 +251,18 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
             localPaths.push(await downloadToTemp(fileLink.toString(), item.fname));
           }
           if (localPaths.length === 0) return;
-          const sendResult = await api.sendMessage(
-            {
-              msg: caption,
-              attachments: localPaths,
-              ...(zaloQuote ? { quote: zaloQuote } : {}),
-              ...(capMentions?.length ? { mentions: capMentions } : {}),
-            },
-            meta.zaloId,
-            meta.threadType === 1 ? ThreadType.Group : ThreadType.User,
+          const sendResult = await sendZalo<ZaloSendMessageResult>(
+            'sendMediaGroup',
+            () => api.sendMessage(
+              {
+                msg: caption,
+                attachments: localPaths,
+                ...(zaloQuote ? { quote: zaloQuote } : {}),
+                ...(capMentions?.length ? { mentions: capMentions } : {}),
+              },
+              meta.zaloId,
+              meta.threadType === 1 ? ThreadType.Group : ThreadType.User,
+            ),
           );
           const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
           if (zaloMsgId !== undefined) {
@@ -312,7 +346,10 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           try { localThumbPath = await extractVideoThumbnail(localVideoPath); } catch { /* no thumb */ }
 
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const videoUploads: any[] = await api.uploadAttachment([localVideoPath], zaloId, threadType);
+          const videoUploads: any[] = await sendZalo(
+            'uploadVideo',
+            () => api.uploadAttachment([localVideoPath], zaloId, threadType),
+          );
           const videoUpload = videoUploads?.find((r: { fileType?: string }) => r.fileType === 'video') as
             { fileUrl?: string } | undefined;
 
@@ -325,7 +362,11 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           if (localThumbPath) {
             try {
               // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              const thumbUploads: any[] = await api.uploadAttachment([localThumbPath], zaloId, threadType);
+              const thumbUploads: any[] = await sendZalo(
+                'uploadVideoThumbnail',
+                () => api.uploadAttachment([localThumbPath], zaloId, threadType),
+                1,
+              );
               const tu = thumbUploads?.[0] as { normalUrl?: string } | undefined;
               if (tu?.normalUrl) thumbUrl = tu.normalUrl;
             } catch { /* keep fallback thumbUrl */ }
@@ -334,17 +375,20 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           sentMsgStore.markSending(zaloId, msg.message_id);
           try {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const result = await (api.sendVideo as (...a: any[]) => Promise<{ msgId?: number }>)(
-              {
-                videoUrl:     videoUpload.fileUrl,
-                thumbnailUrl: thumbUrl,
-                width:        vid.width,
-                height:       vid.height,
-                duration:     (vid.duration ?? 0) * 1000,
-                msg:          cap ?? '',
-              },
-              zaloId,
-              threadType,
+            const result = await sendZalo(
+              'sendVideo',
+              () => (api.sendVideo as (...a: any[]) => Promise<{ msgId?: number }>)(
+                {
+                  videoUrl:     videoUpload.fileUrl,
+                  thumbnailUrl: thumbUrl,
+                  width:        vid.width,
+                  height:       vid.height,
+                  duration:     (vid.duration ?? 0) * 1000,
+                  msg:          cap ?? '',
+                },
+                zaloId,
+                threadType,
+              ),
             );
             if (result?.msgId !== undefined) {
               sentMsgStore.save(msg.message_id, { msgId: result.msgId, zaloId, threadType });
@@ -378,11 +422,14 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         let m4aPath: string | undefined;
         try {
           m4aPath = await convertToM4a(oggPath);
-          const uploaded = await api.uploadAttachment(m4aPath, zaloId, threadType) as Array<{ fileUrl?: string }>;
+          const uploaded = await sendZalo(
+            'uploadVoice',
+            () => api.uploadAttachment(m4aPath, zaloId, threadType),
+          ) as Array<{ fileUrl?: string }>;
           const voiceUrl = uploaded[0]?.fileUrl;
           if (!voiceUrl) throw new Error('No fileUrl from uploadAttachment');
           console.log(`[TG→Zalo] Sending voice → ${voiceUrl}`);
-          await api.sendVoice({ voiceUrl }, zaloId, threadType);
+          await sendZalo('sendVoice', () => api.sendVoice({ voiceUrl }, zaloId, threadType));
           console.log(`[TG→Zalo] Voice sent OK`);
         } catch (err) {
           console.error('[TG→Zalo] Voice convert/send failed, falling back to file:', err);
@@ -414,14 +461,17 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
 
         const { pollStore } = await import('../store/index.js');
         try {
-          const created = await api.createPoll(
-            {
-              question:         tgPoll.question,
-              options:          tgPoll.options.map((o: { text: string }) => o.text),
-              isAnonymous:      false,
-              allowMultiChoices: tgPoll.allows_multiple_answers ?? false,
-            },
-            zaloId,
+          const created = await sendZalo<ZaloCreatePollResult>(
+            'createPoll',
+            () => api.createPoll(
+              {
+                question:         tgPoll.question,
+                options:          tgPoll.options.map((o: { text: string }) => o.text),
+                isAnonymous:      false,
+                allowMultiChoices: tgPoll.allows_multiple_answers ?? false,
+              },
+              zaloId,
+            ),
           );
           console.log(`[TG→Zalo] Zalo poll created: pollId=${created?.poll_id}`);
 
@@ -492,14 +542,17 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         const { latitude, longitude } = msg.location;
         const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`;
         try {
-          await api.sendLink(
-            { msg: '', link: mapsUrl },
-            zaloId,
-            threadType,
+          await sendZalo(
+            'sendLink',
+            () => api.sendLink(
+              { msg: '', link: mapsUrl },
+              zaloId,
+              threadType,
+            ),
           );
           console.log(`[TG→Zalo] Location sent: ${latitude},${longitude}`);
         } catch (err) {
-          await api.sendMessage({ msg: `📍 ${mapsUrl}` }, zaloId, threadType);
+          await sendZalo('sendLocationText', () => api.sendMessage({ msg: `📍 ${mapsUrl}` }, zaloId, threadType));
         }
         return;
       }
@@ -514,7 +567,10 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         if (!cardSent) {
           const body = `👤 <b>Danh thiếp</b>\nTên: <b>${fullName}</b>\nSĐT: <code>${contact.phone_number}</code>`;
           try {
-            await api.sendMessage({ msg: `👤 ${fullName} — ${contact.phone_number}` }, zaloId, threadType);
+            await sendZalo(
+              'sendContact',
+              () => api.sendMessage({ msg: `👤 ${fullName} — ${contact.phone_number}` }, zaloId, threadType),
+            );
           } catch (err) {
             await notifyError('sendContact', err);
           }
