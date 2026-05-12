@@ -5,7 +5,7 @@ import { store, msgStore, sentMsgStore, mediaGroupStore } from '../store/index.j
 import type { MediaGroupItem } from '../store/index.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
-import { downloadToTemp, cleanTemp, convertToM4a, extractVideoThumbnail } from '../utils/media.js';
+import { downloadToTemp, cleanTemp, convertToM4a, compressGifForZalo, convertImageToGif, convertTgsToGif, convertVideoToGif, extractVideoThumbnail, forceUltraSmallGif } from '../utils/media.js';
 import { resolveTgMentions, type TgEntity } from './helpers.js';
 import { runZaloRequest } from '../zalo/rate-limit.js';
 
@@ -17,6 +17,13 @@ interface ZaloSendMessageResult {
 interface ZaloCreatePollResult {
   poll_id?: number;
   options?: Array<{ option_id?: number; content: string; votes?: number }>;
+}
+
+const TELEGRAM_BOT_DOWNLOAD_MAX_MB = 50;
+const TELEGRAM_BOT_DOWNLOAD_MAX_BYTES = TELEGRAM_BOT_DOWNLOAD_MAX_MB * 1024 * 1024;
+
+function formatFileSize(sizeBytes?: number): string {
+  return sizeBytes ? ` (${(sizeBytes / 1024 / 1024).toFixed(1)} MB)` : '';
 }
 
 export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void {
@@ -133,12 +140,17 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         return;
       }
 
-      const TG_FILE_LIMIT = 20 * 1024 * 1024;
       const notifyTooBig = async (filename: string, sizeBytes?: number) => {
-        const sizeMb = sizeBytes ? ` (${(sizeBytes / 1024 / 1024).toFixed(1)} MB)` : '';
         await notifyError(
           `sendAttachment(${filename})`,
-          new Error(`File${sizeMb} vượt giới hạn 20 MB của Telegram Bot API — không thể tải xuống`),
+          new Error(`File${formatFileSize(sizeBytes)} vượt giới hạn ${TELEGRAM_BOT_DOWNLOAD_MAX_MB} MB cấu hình — không thể tải xuống`),
+        );
+      };
+
+      const notifyDownloadRejected = async (filename: string, sizeBytes?: number) => {
+        await notifyError(
+          `sendAttachment(${filename})`,
+          new Error(`Telegram Bot API từ chối tải xuống file${formatFileSize(sizeBytes)}. Nếu đang dùng cloud Bot API, giới hạn thực tế có thể thấp hơn ${TELEGRAM_BOT_DOWNLOAD_MAX_MB} MB.`),
         );
       };
 
@@ -149,7 +161,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         caption?: string,
         captionMentions?: Array<{ pos: number; uid: string; len: number }>,
       ) => {
-        if (fileSize !== undefined && fileSize > TG_FILE_LIMIT) {
+        if (fileSize !== undefined && fileSize > TELEGRAM_BOT_DOWNLOAD_MAX_BYTES) {
           await notifyTooBig(filename, fileSize);
           return;
         }
@@ -162,7 +174,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           fileLink = await ctx.telegram.getFileLink(fileId);
         } catch (err: unknown) {
           const isTooBig = err instanceof Error && err.message.includes('file is too big');
-          if (isTooBig) { await notifyTooBig(filename, fileSize); return; }
+          if (isTooBig) { await notifyDownloadRejected(filename, fileSize); return; }
           throw err;
         }
         const localPath = await downloadToTemp(fileLink.toString(), filename);
@@ -329,7 +341,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           return;
         }
 
-        if ((vid.file_size ?? 0) > TG_FILE_LIMIT) {
+        if ((vid.file_size ?? 0) > TELEGRAM_BOT_DOWNLOAD_MAX_BYTES) {
           await notifyTooBig(fname, vid.file_size);
           return;
         }
@@ -337,7 +349,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         try { fileLink = await ctx.telegram.getFileLink(vid.file_id); }
         catch (err: unknown) {
           const isTooBig = err instanceof Error && err.message.includes('file is too big');
-          if (isTooBig) { await notifyTooBig(fname, vid.file_size); return; }
+          if (isTooBig) { await notifyDownloadRejected(fname, vid.file_size); return; }
           throw err;
         }
         const localVideoPath = await downloadToTemp(fileLink.toString(), fname);
@@ -407,7 +419,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
       }
 
       if ('voice' in msg && msg.voice) {
-        if ((msg.voice.file_size ?? 0) > TG_FILE_LIMIT) {
+        if ((msg.voice.file_size ?? 0) > TELEGRAM_BOT_DOWNLOAD_MAX_BYTES) {
           await notifyTooBig(`voice_${Date.now()}.ogg`, msg.voice.file_size);
           return;
         }
@@ -415,7 +427,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
         try { fileLink = await ctx.telegram.getFileLink(msg.voice.file_id); }
         catch (err: unknown) {
           const isTooBig = err instanceof Error && err.message.includes('file is too big');
-          if (isTooBig) { await notifyTooBig(`voice_${Date.now()}.ogg`, msg.voice.file_size); return; }
+          if (isTooBig) { await notifyDownloadRejected(`voice_${Date.now()}.ogg`, msg.voice.file_size); return; }
           throw err;
         }
         const oggPath  = await downloadToTemp(fileLink.toString(), `voice_${Date.now()}.ogg`);
@@ -443,6 +455,55 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
 
       if ('sticker' in msg && msg.sticker) {
         const sticker = msg.sticker;
+        console.log(`[TG→Zalo] Sticker flags animated=${Boolean(sticker.is_animated)} video=${Boolean(sticker.is_video)} thumb=${Boolean(sticker.thumbnail)}`);
+        let sourcePath: string | undefined;
+        let rawGifPath: string | undefined;
+        let gifPath: string | undefined;
+        try {
+          const fileLink = await ctx.telegram.getFileLink(sticker.file_id);
+          const sourceExt = sticker.is_video ? '.webm' : (sticker.is_animated ? '.tgs' : '.webp');
+          sourcePath = await downloadToTemp(fileLink.toString(), `sticker_${Date.now()}${sourceExt}`);
+          rawGifPath = sticker.is_video
+            ? await convertVideoToGif(sourcePath)
+            : (sticker.is_animated ? await convertTgsToGif(sourcePath) : await convertImageToGif(sourcePath));
+          const convertedGifPath = await compressGifForZalo(rawGifPath);
+          gifPath = convertedGifPath;
+          sentMsgStore.markSending(zaloId, msg.message_id);
+          try {
+            let sendResult: ZaloSendMessageResult;
+            try {
+              sendResult = await sendZalo<ZaloSendMessageResult>(
+                'sendStickerGif',
+                () => api.sendMessage({ msg: '', attachments: [convertedGifPath] }, zaloId, threadType),
+              );
+            } catch (sendErr) {
+              if ((sendErr as { code?: number }).code !== 200) throw sendErr;
+              console.warn('[TG→Zalo] Sticker GIF exceeded Zalo upload processing limit; retrying ultra-small GIF.');
+              const ultraGifPath = await forceUltraSmallGif(convertedGifPath);
+              if (gifPath && gifPath !== rawGifPath) await cleanTemp(gifPath);
+              gifPath = ultraGifPath;
+              sendResult = await sendZalo<ZaloSendMessageResult>(
+                'sendStickerGif(ultra)',
+                () => api.sendMessage({ msg: '', attachments: [ultraGifPath] }, zaloId, threadType),
+              );
+            }
+            const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
+            if (zaloMsgId !== undefined) {
+              sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+            }
+          } finally {
+            sentMsgStore.unmarkSending(zaloId);
+          }
+          console.log(`[TG→Zalo] ${sticker.is_video ? 'Video' : (sticker.is_animated ? 'Animated' : 'Static')} sticker converted to GIF and sent`);
+          return;
+        } catch (err) {
+          console.error('[TG→Zalo] Sticker→GIF failed, falling back to thumbnail:', err);
+        } finally {
+          if (sourcePath) await cleanTemp(sourcePath);
+          if (rawGifPath && rawGifPath !== gifPath) await cleanTemp(rawGifPath);
+          if (gifPath) await cleanTemp(gifPath);
+        }
+
         const useThumb = (sticker.is_animated || sticker.is_video) && sticker.thumbnail;
         const fileId   = useThumb ? sticker.thumbnail!.file_id : sticker.file_id;
         const ext      = useThumb ? '.jpg' : '.webp';

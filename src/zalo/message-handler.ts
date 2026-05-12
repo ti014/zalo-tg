@@ -238,17 +238,25 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
                 let firstSaved = false;
                 for (let i = 0; i < localPaths.length; i += BATCH) {
                   const batch = localPaths.slice(i, i + BATCH);
-                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                  const mediaItems: any[] = batch.map((lp, j) => ({
-                    type: 'photo',
-                    media: { source: createReadStream(lp) },
-                    ...(i === 0 && j === 0 && captionText ? { caption: captionText, parse_mode: 'HTML' } : {}),
-                  }));
-                  const sentMsgs = await tg.sendMediaGroup(
-                    config.telegram.groupId,
-                    mediaItems,
-                    { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
-                  );
+                  const firstItemCaption = i === 0 ? captionText : undefined;
+                  const sentMsgs = batch.length === 1
+                    ? [await tg.sendPhoto(
+                        config.telegram.groupId,
+                        { source: createReadStream(batch[0]!) },
+                        {
+                          message_thread_id: buf.topicId,
+                          ...(firstItemCaption ? { caption: firstItemCaption, parse_mode: 'HTML' as const } : {}),
+                        },
+                      )]
+                    : await tg.sendMediaGroup(
+                        config.telegram.groupId,
+                        batch.map((lp, j) => ({
+                          type: 'photo' as const,
+                          media: { source: createReadStream(lp) },
+                          ...(j === 0 && firstItemCaption ? { caption: firstItemCaption, parse_mode: 'HTML' as const } : {}),
+                        })),
+                        { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
+                      );
                   if (!firstSaved && sentMsgs.length > 0) {
                     firstSaved = true;
                     msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, {
