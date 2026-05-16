@@ -4,6 +4,7 @@ import { store, msgStore, pollStore, sentMsgStore, reactionEchoStore, reactionSu
 import { config } from '../config.js';
 import { escapeHtml } from '../utils/format.js';
 import { buildScoreText, resolveUserDisplayName, tg } from './helpers.js';
+import { runZaloRequest } from './rate-limit.js';
 
 export function registerZaloEventHandlers(api: ZaloAPI): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -170,7 +171,12 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
           if (entry) {
             await new Promise(r => setTimeout(r, 600));
             let detail: Awaited<ReturnType<typeof api.getPollDetail>> | undefined;
-            try { detail = await api.getPollDetail(pollId); } catch { /* ignore */ }
+            try {
+              detail = await runZaloRequest(
+                { label: `getPollDetail(${pollId}:group_event)`, priority: 'low', maxRetries: 0 },
+                () => api.getPollDetail(pollId),
+              );
+            } catch { /* ignore */ }
             if (detail?.options) {
               const actorName = data?.updateMembers?.[0]?.dName ?? data?.creatorId ?? '';
               const header = actorName ? `${actorName} vừa bình chọn` : 'Cập nhật bình chọn';
@@ -256,7 +262,10 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
 
       let displayName = fromUid;
       try {
-        const info = await api.getUserInfo(fromUid) as {
+        const info = await runZaloRequest(
+          { label: `getUserInfo(friend:${fromUid})`, priority: 'low', maxRetries: 0 },
+          () => api.getUserInfo(fromUid),
+        ) as {
           display_name?: string;
           zaloName?: string;
           changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;

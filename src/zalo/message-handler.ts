@@ -12,18 +12,41 @@ import { applyMentionsHtml, formatGroupMsgHtml, groupCaption, truncate, escapeHt
 import {
   buildScoreText,
   getCachedGroupInfo,
+  getCachedUserDisplayName,
   isMutedZaloGroup,
   parseBankCardHtml,
   parseContent,
+  refreshCachedGroupInfo,
   resolveUserDisplayName,
   tg,
 } from './helpers.js';
+import { runZaloRequest } from './rate-limit.js';
 import { getOrCreateTopic, isTopicDeletedError } from './topic.js';
 
-const inFlightMsgIds = new Set<string>();
+const inFlightMsgIds = new Map<string, ReturnType<typeof setTimeout>>();
+const IN_FLIGHT_MSG_TTL_MS = 90_000;
+
+function markMessageInFlight(msgId: string): void {
+  const existing = inFlightMsgIds.get(msgId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(() => inFlightMsgIds.delete(msgId), IN_FLIGHT_MSG_TTL_MS);
+  inFlightMsgIds.set(msgId, timer);
+}
+
+function unmarkMessageInFlight(msgId: string | undefined): void {
+  if (!msgId) return;
+  const timer = inFlightMsgIds.get(msgId);
+  if (timer) clearTimeout(timer);
+  inFlightMsgIds.delete(msgId);
+}
+
+function unmarkMessagesInFlight(msgIds: string[]): void {
+  for (const msgId of msgIds) unmarkMessageInFlight(msgId);
+}
 
 export function registerZaloMessageHandler(api: ZaloAPI): void {
   api.listener.on('message', async (msg: ZaloMessage) => {
+    let keepInFlightUntilTtl = false;
     try {
       if (msg.isSelf) {
         const validId = (id: unknown): id is string | number => id !== undefined && id !== null && String(id) !== '' && String(id) !== '0';
@@ -62,8 +85,7 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
           console.log(`[Zalo→TG] Skip duplicate/reaction re-emit msgId=${primaryMsgId}`);
           return;
         }
-        inFlightMsgIds.add(primaryMsgId);
-        setTimeout(() => inFlightMsgIds.delete(primaryMsgId), 10_000);
+        markMessageInFlight(primaryMsgId);
       }
 
       const zaloId     = msg.threadId;
@@ -104,13 +126,19 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
       let displayName = senderName;
       let groupAvatarUrl: string | undefined;
       if (type === ThreadType.Group) {
-        const info = await getCachedGroupInfo(api, zaloId);
-        displayName = info.name || senderName;
-        groupAvatarUrl = info.avt;
+        const info = getCachedGroupInfo(zaloId);
+        displayName = info?.name || senderName;
+        groupAvatarUrl = info?.avt;
+        if (!info) {
+          void refreshCachedGroupInfo(api, zaloId).catch(() => undefined);
+        }
       } else {
         const aliasName = aliasCache.get(zaloId);
-        const realName = aliasName ?? await resolveUserDisplayName(api, zaloId, senderName);
+        const realName = aliasName ?? getCachedUserDisplayName(zaloId, senderName);
         displayName = aliasName ?? aliasCache.label(zaloId, realName);
+        if (!aliasName && !userCache.getName(zaloId)?.trim()) {
+          void resolveUserDisplayName(api, zaloId, senderName).catch(() => undefined);
+        }
       }
 
       const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
@@ -182,99 +210,104 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
         const photoCaption = media.description?.trim() || undefined;
         const albumKey = `${zaloId}:${msg.data.uidFrom}`;
 
+        keepInFlightUntilTtl = true;
         zaloAlbumStore.add(
           albumKey,
           url,
           zaloMsgIds[0],
           { senderName, topicId, tgBase, zaloQuote: zaloQuoteData },
           async (buf) => {
-            if (buf.urls.length === 1) {
-              const singleUrl = buf.urls[0]!;
-              const localPath = await (earlyDlPromise ?? downloadToTemp(singleUrl, `photo_${Date.now()}.jpg`));
-              const stream = createReadStream(localPath);
-              try {
-                const sent = await tg.sendPhoto(
-                  config.telegram.groupId,
-                  { source: stream },
-                  {
-                    ...buf.tgBase,
-                    parse_mode: 'HTML' as const,
-                    caption: type === ThreadType.Group
-                      ? photoCaption
-                        ? `${groupCaption(buf.senderName)}\n${escapeHtml(photoCaption)}`
-                        : groupCaption(buf.senderName)
-                      : photoCaption ? escapeHtml(photoCaption) : undefined,
-                  },
-                );
-                msgStore.save(sent.message_id, buf.zaloMsgIds, {
-                  msgId: buf.zaloMsgIds[0]!,
-                  cliMsgId: '',
-                  uidFrom: msg.data.uidFrom,
-                  ts: msg.data.ts,
-                  msgType,
-                  content: msg.data.content as string | Record<string, unknown>,
-                  ttl: msg.data.ttl ?? 0,
-                  zaloId,
-                  threadType: type,
-                });
-              } finally { await cleanTemp(localPath); }
-            } else {
-              const localPaths: string[] = [];
-              try {
-                const dlResults = await Promise.allSettled(buf.urls.map(u => downloadToTemp(u, `photo_${Date.now()}.jpg`)));
-                const dlPaths = dlResults.flatMap(r => {
-                  if (r.status === 'fulfilled') return [r.value];
-                  console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
-                  return [];
-                });
-                if (dlPaths.length === 0) return;
-                localPaths.push(...dlPaths);
-                const captionText = type === ThreadType.Group
-                  ? photoCaption
-                    ? `${groupCaption(buf.senderName)}\n${escapeHtml(photoCaption)}`
-                    : groupCaption(buf.senderName)
-                  : photoCaption ? escapeHtml(photoCaption) : undefined;
-                const BATCH = 10;
-                let firstSaved = false;
-                for (let i = 0; i < localPaths.length; i += BATCH) {
-                  const batch = localPaths.slice(i, i + BATCH);
-                  const firstItemCaption = i === 0 ? captionText : undefined;
-                  const sentMsgs = batch.length === 1
-                    ? [await tg.sendPhoto(
-                        config.telegram.groupId,
-                        { source: createReadStream(batch[0]!) },
-                        {
-                          message_thread_id: buf.topicId,
-                          ...(firstItemCaption ? { caption: firstItemCaption, parse_mode: 'HTML' as const } : {}),
-                        },
-                      )]
-                    : await tg.sendMediaGroup(
-                        config.telegram.groupId,
-                        batch.map((lp, j) => ({
-                          type: 'photo' as const,
-                          media: { source: createReadStream(lp) },
-                          ...(j === 0 && firstItemCaption ? { caption: firstItemCaption, parse_mode: 'HTML' as const } : {}),
-                        })),
-                        { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
-                      );
-                  if (!firstSaved && sentMsgs.length > 0) {
-                    firstSaved = true;
-                    msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, {
-                      msgId: buf.zaloMsgIds[0]!,
-                      cliMsgId: '',
-                      uidFrom: msg.data.uidFrom,
-                      ts: msg.data.ts,
-                      msgType,
-                      content: msg.data.content as string | Record<string, unknown>,
-                      ttl: msg.data.ttl ?? 0,
-                      zaloId,
-                      threadType: type,
-                    });
+            try {
+              if (buf.urls.length === 1) {
+                const singleUrl = buf.urls[0]!;
+                const localPath = await (earlyDlPromise ?? downloadToTemp(singleUrl, `photo_${Date.now()}.jpg`));
+                const stream = createReadStream(localPath);
+                try {
+                  const sent = await tg.sendPhoto(
+                    config.telegram.groupId,
+                    { source: stream },
+                    {
+                      ...buf.tgBase,
+                      parse_mode: 'HTML' as const,
+                      caption: type === ThreadType.Group
+                        ? photoCaption
+                          ? `${groupCaption(buf.senderName)}\n${escapeHtml(photoCaption)}`
+                          : groupCaption(buf.senderName)
+                        : photoCaption ? escapeHtml(photoCaption) : undefined,
+                    },
+                  );
+                  msgStore.save(sent.message_id, buf.zaloMsgIds, {
+                    msgId: buf.zaloMsgIds[0]!,
+                    cliMsgId: '',
+                    uidFrom: msg.data.uidFrom,
+                    ts: msg.data.ts,
+                    msgType,
+                    content: msg.data.content as string | Record<string, unknown>,
+                    ttl: msg.data.ttl ?? 0,
+                    zaloId,
+                    threadType: type,
+                  });
+                } finally { await cleanTemp(localPath); }
+              } else {
+                const localPaths: string[] = [];
+                try {
+                  const dlResults = await Promise.allSettled(buf.urls.map(u => downloadToTemp(u, `photo_${Date.now()}.jpg`)));
+                  const dlPaths = dlResults.flatMap(r => {
+                    if (r.status === 'fulfilled') return [r.value];
+                    console.warn('[ZaloHandler] Album: skipping failed photo download:', r.reason);
+                    return [];
+                  });
+                  if (dlPaths.length === 0) return;
+                  localPaths.push(...dlPaths);
+                  const captionText = type === ThreadType.Group
+                    ? photoCaption
+                      ? `${groupCaption(buf.senderName)}\n${escapeHtml(photoCaption)}`
+                      : groupCaption(buf.senderName)
+                    : photoCaption ? escapeHtml(photoCaption) : undefined;
+                  const BATCH = 10;
+                  let firstSaved = false;
+                  for (let i = 0; i < localPaths.length; i += BATCH) {
+                    const batch = localPaths.slice(i, i + BATCH);
+                    const firstItemCaption = i === 0 ? captionText : undefined;
+                    const sentMsgs = batch.length === 1
+                      ? [await tg.sendPhoto(
+                          config.telegram.groupId,
+                          { source: createReadStream(batch[0]!) },
+                          {
+                            message_thread_id: buf.topicId,
+                            ...(firstItemCaption ? { caption: firstItemCaption, parse_mode: 'HTML' as const } : {}),
+                          },
+                        )]
+                      : await tg.sendMediaGroup(
+                          config.telegram.groupId,
+                          batch.map((lp, j) => ({
+                            type: 'photo' as const,
+                            media: { source: createReadStream(lp) },
+                            ...(j === 0 && firstItemCaption ? { caption: firstItemCaption, parse_mode: 'HTML' as const } : {}),
+                          })),
+                          { message_thread_id: buf.topicId } as Parameters<typeof tg.sendMediaGroup>[2],
+                        );
+                    if (!firstSaved && sentMsgs.length > 0) {
+                      firstSaved = true;
+                      msgStore.save(sentMsgs[0]!.message_id, buf.zaloMsgIds, {
+                        msgId: buf.zaloMsgIds[0]!,
+                        cliMsgId: '',
+                        uidFrom: msg.data.uidFrom,
+                        ts: msg.data.ts,
+                        msgType,
+                        content: msg.data.content as string | Record<string, unknown>,
+                        ttl: msg.data.ttl ?? 0,
+                        zaloId,
+                        threadType: type,
+                      });
+                    }
                   }
+                } finally {
+                  for (const lp of localPaths) await cleanTemp(lp);
                 }
-              } finally {
-                for (const lp of localPaths) await cleanTemp(lp);
               }
+            } finally {
+              unmarkMessagesInFlight(buf.zaloMsgIds);
             }
           },
         );
@@ -367,7 +400,10 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
         }
         try {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const details: any[] = await api.getStickersDetail([stickerId]);
+          const details: any[] = await runZaloRequest(
+            { label: `getStickersDetail(${stickerId})`, priority: 'low', maxRetries: 0 },
+            () => api.getStickersDetail([stickerId]),
+          );
           const detail = details?.[0];
           const url: string | undefined =
             detail?.stickerWebpUrl ?? detail?.stickerUrl ?? detail?.stickerSpriteUrl;
@@ -552,7 +588,10 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
 
         let pollDetail: Awaited<ReturnType<typeof api.getPollDetail>> | undefined;
         try {
-          pollDetail = await api.getPollDetail(pollId);
+          pollDetail = await runZaloRequest(
+            { label: `getPollDetail(${pollId})`, priority: 'low', maxRetries: 0 },
+            () => api.getPollDetail(pollId),
+          );
           console.log(`[ZaloHandler] Poll detail: num_vote=${pollDetail?.num_vote} options=`, pollDetail?.options?.map((o: { content: string; votes: number }) => `${o.content}=${o.votes}`).join(','));
         } catch (e) {
           console.warn('[ZaloHandler] getPollDetail failed:', e);
@@ -609,7 +648,12 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
         } else {
           await new Promise(r => setTimeout(r, 800));
           let updatedDetail = pollDetail;
-          try { updatedDetail = await api.getPollDetail(pollId); } catch { /* use existing */ }
+          try {
+            updatedDetail = await runZaloRequest(
+              { label: `getPollDetail(${pollId}:update)`, priority: 'low', maxRetries: 0 },
+              () => api.getPollDetail(pollId),
+            );
+          } catch { /* use existing */ }
           const header = type === ThreadType.Group
             ? `${senderName} vừa bình chọn`
             : 'Cập nhật bình chọn';
@@ -670,7 +714,10 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
           let contactName = userCache.getName(uid) ?? uid;
           if (uid && contactName === uid) {
             try {
-              const resp = await api.getUserInfo(uid) as {
+              const resp = await runZaloRequest(
+                { label: `getUserInfo(contact:${uid})`, priority: 'low', maxRetries: 0 },
+                () => api.getUserInfo(uid),
+              ) as {
                 changed_profiles?: Record<string, { displayName?: string }>;
               };
               contactName = resp?.changed_profiles?.[uid]?.displayName ?? uid;
@@ -727,6 +774,8 @@ export function registerZaloMessageHandler(api: ZaloAPI): void {
       } else {
         console.error('[ZaloHandler] Error:', err);
       }
+    } finally {
+      if (!keepInFlightUntilTtl) unmarkMessageInFlight(msg.data.msgId);
     }
   });
 }

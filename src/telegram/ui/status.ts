@@ -1,6 +1,6 @@
 import type { ZaloAPI } from '../../zalo/types.js';
 import { settingsStore, store } from '../../store/index.js';
-import { getZaloRateLimitStatus } from '../../zalo/rate-limit.js';
+import { getZaloRateLimitStatus, runZaloRequest } from '../../zalo/rate-limit.js';
 import { menuKeyboard, settingsKeyboard, statusKeyboard, type InlineKeyboardMarkup } from './keyboards.js';
 import { renderMenu, renderSettings, renderStatus, type MenuViewModel, type StatusViewModel } from './renderers.js';
 
@@ -42,7 +42,10 @@ async function getAccountName(api: ZaloAPI | null, forceRefresh: boolean): Promi
   if (!forceRefresh && accountCache && accountCache.expiresAt > now) return accountCache.name;
 
   try {
-    const info = await api.fetchAccountInfo() as {
+    const info = await runZaloRequest(
+      { label: 'fetchAccountInfo(status)', priority: 'low', maxRetries: 0 },
+      () => api.fetchAccountInfo(),
+    ) as {
       profile?: { displayName?: string; zaloName?: string };
     } | undefined;
     const name = info?.profile?.displayName ?? info?.profile?.zaloName;

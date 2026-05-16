@@ -8,6 +8,7 @@ import { config } from './config.js';
 import { startUpdateChecker, type UpdateCheckerHandle } from './updater.js';
 import { store, flushMsgStore } from './store/index.js';
 import { acquireInstanceLock, type InstanceLock } from './runtime/single-instance.js';
+import { runZaloRequest } from './zalo/rate-limit.js';
 
 let setZaloApiRef: ((api: ZaloAPI) => void) | null = null;
 let activeZaloApi: ZaloAPI | null = null;
@@ -15,6 +16,8 @@ let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnecting = false;
 let shuttingDown = false;
 let reconnectDelayMs = 5_000;
+let lastZaloEventAt = Date.now();
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 let updateChecker: UpdateCheckerHandle | null = null;
 let instanceLock: InstanceLock | null = null;
 
@@ -27,10 +30,32 @@ function clearReconnectTimer(): void {
   reconnectTimer = null;
 }
 
+function stopZaloWatchdog(): void {
+  if (!watchdogTimer) return;
+  clearInterval(watchdogTimer);
+  watchdogTimer = null;
+}
+
+function touchZaloEvent(): void {
+  lastZaloEventAt = Date.now();
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timeout after ${Math.round(ms / 1000)}s`)), ms);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 async function stopZaloListener(api: ZaloAPI | null): Promise<void> {
   if (!api) return;
   try {
-    await api.listener.stop();
+    await withTimeout(api.listener.stop(), 10_000, 'Zalo listener stop');
   } catch (err) {
     console.warn('[Boot] Failed to stop Zalo listener:', err);
   }
@@ -42,6 +67,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
   console.log(`\n[Boot] Received ${signal}, shutting down...`);
   clearReconnectTimer();
   updateChecker?.stop();
+  stopZaloWatchdog();
   await stopZaloListener(activeZaloApi);
   try { tgBot.stop(signal); } catch { /* ignore */ }
   try { flushMsgStore(); } catch { /* ignore */ }
@@ -60,7 +86,10 @@ process.on('uncaughtException', (err) => {
 
 async function pruneLeftGroupTopics(api: ZaloAPI): Promise<void> {
   try {
-    const groups = await api.getAllGroups() as { gridVerMap?: Record<string, string> } | undefined;
+    const groups = await runZaloRequest(
+      { label: 'getAllGroups(pruneLeftGroupTopics)', priority: 'low', maxRetries: 0 },
+      () => api.getAllGroups(),
+    ) as { gridVerMap?: Record<string, string> } | undefined;
     const activeGroupIds = new Set(Object.keys(groups?.gridVerMap ?? {}));
     const removed: string[] = [];
 
@@ -89,6 +118,7 @@ function scheduleZaloReconnect(delayMs = reconnectDelayMs): void {
 
 async function reconnectZalo(): Promise<void> {
   if (shuttingDown || reconnecting) return;
+  stopZaloWatchdog();
   reconnecting = true;
   try {
     await stopZaloListener(activeZaloApi);
@@ -112,6 +142,24 @@ async function reconnectZalo(): Promise<void> {
   }
 }
 
+function startZaloWatchdog(api: ZaloAPI): void {
+  stopZaloWatchdog();
+  lastZaloEventAt = Date.now();
+
+  const eventNames = ['message', 'undo', 'reaction', 'group_event', 'friend_event'];
+  for (const eventName of eventNames) {
+    api.listener.on(eventName, touchZaloEvent);
+  }
+
+  watchdogTimer = setInterval(() => {
+    if (shuttingDown || reconnecting || api !== activeZaloApi) return;
+    const idleMs = Date.now() - lastZaloEventAt;
+    if (idleMs < 5 * 60_000) return;
+    console.warn(`[Boot] Zalo listener idle for ${Math.round(idleMs / 1000)}s, reconnecting...`);
+    void reconnectZalo();
+  }, 60_000);
+}
+
 async function startZalo(api: ZaloAPI, isReconnect = false): Promise<void> {
   if (shuttingDown) return;
   clearReconnectTimer();
@@ -131,6 +179,7 @@ async function startZalo(api: ZaloAPI, isReconnect = false): Promise<void> {
     startedZaloListeners.add(api as object);
   }
   console.log(`[Boot] Zalo listener ${isReconnect ? 're' : ''}started ✓`);
+  startZaloWatchdog(api);
 
   if (!wiredDisconnectHandlers.has(api as object)) {
     wiredDisconnectHandlers.add(api as object);

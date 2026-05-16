@@ -5,15 +5,31 @@ const DEFAULT_RETRY_DELAY_MS = 45_000;
 const LOW_PRIORITY_MIN_INTERVAL_MS = 2_500;
 const LOW_PRIORITY_RETRY_DELAY_MS = 120_000;
 
-let queue: Promise<void> = Promise.resolve();
-let nextAllowedAt = 0;
-let queuedRequests = 0;
-let activeRequests = 0;
+type ZaloRequestPriority = 'high' | 'low';
+
+interface QueueItem<T> {
+  task: () => Promise<T>;
+  resolve: (value: T) => void;
+  reject: (err: unknown) => void;
+}
+
+interface LaneState {
+  queue: QueueItem<unknown>[];
+  activeRequests: number;
+  nextAllowedAt: number;
+  concurrency: number;
+}
+
+const lanes: Record<ZaloRequestPriority, LaneState> = {
+  high: { queue: [], activeRequests: 0, nextAllowedAt: 0, concurrency: 2 },
+  low:  { queue: [], activeRequests: 0, nextAllowedAt: 0, concurrency: 1 },
+};
+
 let lastRateLimit: { at: number; label: string } | null = null;
 
 export interface ZaloRequestOptions {
   label: string;
-  priority?: 'high' | 'low';
+  priority?: ZaloRequestPriority;
   maxRetries?: number;
   minIntervalMs?: number;
   retryDelayMs?: number;
@@ -27,34 +43,37 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function enqueue<T>(task: () => Promise<T>): Promise<T> {
-  queuedRequests += 1;
-  const run = queue.then(async () => {
-    queuedRequests = Math.max(0, queuedRequests - 1);
-    activeRequests += 1;
-    try {
-      return await task();
-    } finally {
-      activeRequests = Math.max(0, activeRequests - 1);
-    }
-  }, async () => {
-    queuedRequests = Math.max(0, queuedRequests - 1);
-    activeRequests += 1;
-    try {
-      return await task();
-    } finally {
-      activeRequests = Math.max(0, activeRequests - 1);
-    }
+function enqueue<T>(priority: ZaloRequestPriority, task: () => Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    lanes[priority].queue.push({ task, resolve: resolve as (value: unknown) => void, reject });
+    scheduleLane(priority);
   });
-  queue = run.then(() => undefined, () => undefined);
-  return run;
 }
 
-async function waitForTurn(minIntervalMs: number): Promise<void> {
-  const now = Date.now();
-  const waitMs = Math.max(0, nextAllowedAt - now);
+function scheduleLane(priority: ZaloRequestPriority): void {
+  const lane = lanes[priority];
+  while (lane.activeRequests < lane.concurrency && lane.queue.length > 0) {
+    const item = lane.queue.shift()!;
+    lane.activeRequests += 1;
+    void runLaneItem(priority, item);
+  }
+}
+
+async function runLaneItem(priority: ZaloRequestPriority, item: QueueItem<unknown>): Promise<void> {
+  try {
+    item.resolve(await item.task());
+  } catch (err) {
+    item.reject(err);
+  } finally {
+    lanes[priority].activeRequests = Math.max(0, lanes[priority].activeRequests - 1);
+    scheduleLane(priority);
+  }
+}
+
+async function waitForTurn(lane: LaneState, minIntervalMs: number): Promise<void> {
+  const waitMs = Math.max(0, lane.nextAllowedAt - Date.now());
   if (waitMs > 0) await sleep(waitMs);
-  nextAllowedAt = Date.now() + minIntervalMs;
+  lane.nextAllowedAt = Date.now() + minIntervalMs;
 }
 
 export interface ZaloRateLimitStatus {
@@ -65,10 +84,13 @@ export interface ZaloRateLimitStatus {
 }
 
 export function getZaloRateLimitStatus(now = Date.now()): ZaloRateLimitStatus {
+  const queueLength = lanes.high.queue.length + lanes.low.queue.length;
+  const activeRequests = lanes.high.activeRequests + lanes.low.activeRequests;
+  const cooldowns = [lanes.high.nextAllowedAt, lanes.low.nextAllowedAt].filter(t => t > now);
   return {
-    queueLength: queuedRequests,
+    queueLength,
     activeRequests,
-    cooldownUntil: nextAllowedAt > now ? nextAllowedAt : null,
+    cooldownUntil: cooldowns.length > 0 ? Math.max(...cooldowns) : null,
     lastRateLimit,
   };
 }
@@ -78,6 +100,7 @@ export async function runZaloRequest<T>(
   request: () => Promise<T>,
 ): Promise<T> {
   const priority = options.priority ?? 'high';
+  const lane = lanes[priority];
   const minIntervalMs = options.minIntervalMs ?? (
     priority === 'low' ? LOW_PRIORITY_MIN_INTERVAL_MS : DEFAULT_MIN_INTERVAL_MS
   );
@@ -86,17 +109,17 @@ export async function runZaloRequest<T>(
   );
   const maxRetries = options.maxRetries ?? (priority === 'low' ? 0 : 2);
 
-  return enqueue(async () => {
+  return enqueue(priority, async () => {
     let attempt = 0;
     while (true) {
-      await waitForTurn(minIntervalMs);
+      await waitForTurn(lane, minIntervalMs);
       try {
         return await request();
       } catch (err) {
         if (!isZaloRateLimitError(err)) throw err;
 
         lastRateLimit = { at: Date.now(), label: options.label };
-        nextAllowedAt = Math.max(nextAllowedAt, Date.now() + retryDelayMs);
+        lane.nextAllowedAt = Math.max(lane.nextAllowedAt, Date.now() + retryDelayMs);
         if (attempt >= maxRetries) throw err;
 
         attempt += 1;

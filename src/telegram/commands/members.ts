@@ -29,7 +29,10 @@ async function loadGroupMembers(
 ): Promise<MemberInfo[]> {
   if (!api) return [];
 
-  const info = await api.getGroupInfo(groupId) as {
+  const info = await runZaloRequest(
+    { label: `getGroupInfo(members:${groupId})`, priority: 'low', maxRetries: 0 },
+    () => api.getGroupInfo(groupId),
+  ) as {
     gridInfoMap?: Record<string, { memVerList?: string[] }>;
   };
   const memVerList = info?.gridInfoMap?.[groupId]?.memVerList ?? [];

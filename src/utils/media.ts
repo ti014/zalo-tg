@@ -49,11 +49,23 @@ function getFfmpegPath(): string {
   return ffmpegPath;
 }
 
+const CHILD_PROCESS_TIMEOUT_MS = 120_000;
+
 async function runFfmpeg(args: string[], label: string): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     const ff = spawn(getFfmpegPath(), args);
-    ff.on('close', code => code === 0 ? resolve() : reject(new Error(`${label} exit ${code}`)));
-    ff.on('error', reject);
+    const timer = setTimeout(() => {
+      ff.kill('SIGKILL');
+      reject(new Error(`${label} timeout after ${Math.round(CHILD_PROCESS_TIMEOUT_MS / 1000)}s`));
+    }, CHILD_PROCESS_TIMEOUT_MS);
+    ff.on('close', code => {
+      clearTimeout(timer);
+      code === 0 ? resolve() : reject(new Error(`${label} exit ${code}`));
+    });
+    ff.on('error', err => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
 }
 
@@ -109,8 +121,16 @@ Module._load = function patchedLoad(request, parent, isMain) {
     child.stderr?.on('data', (chunk: Buffer | string) => {
       stderr = (stderr + String(chunk)).slice(-12_000);
     });
-    child.on('error', reject);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`TGS converter timeout after ${Math.round(CHILD_PROCESS_TIMEOUT_MS / 1000)}s`));
+    }, CHILD_PROCESS_TIMEOUT_MS);
+    child.on('error', err => {
+      clearTimeout(timer);
+      reject(err);
+    });
     child.on('close', code => {
+      clearTimeout(timer);
       if (code === 0) {
         resolve();
         return;

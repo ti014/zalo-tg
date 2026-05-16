@@ -15,6 +15,7 @@ interface QueueItem {
 
 const MAX_RETRIES  = 5;
 const CONCURRENCY  = 5;   // max simultaneous in-flight TG calls
+const TG_CALL_TIMEOUT_MS = 45_000;
 const _queue: QueueItem[] = [];
 let   _active    = 0;
 let   _pauseUntil = 0; // epoch ms — global back-off on 429
@@ -35,6 +36,18 @@ function is429(err: unknown): number | null {
   return null;
 }
 
+function withTimeout<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`Telegram API timeout after ${Math.round(TG_CALL_TIMEOUT_MS / 1000)}s`)), TG_CALL_TIMEOUT_MS);
+    }),
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 function scheduleNext(): void {
   while (_active < CONCURRENCY && _queue.length > 0) {
     const item = _queue.shift()!;
@@ -49,7 +62,7 @@ async function runOne(item: QueueItem): Promise<void> {
     const wait = _pauseUntil - Date.now();
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
 
-    const result = await item.fn();
+    const result = await withTimeout(item.fn());
     item.resolve(result);
   } catch (err) {
     const retryAfter = is429(err);

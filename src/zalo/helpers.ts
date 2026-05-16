@@ -105,12 +105,16 @@ interface GroupInfoEntry { name: string; avt?: string; ts: number }
 const _groupInfoCache = new Map<string, GroupInfoEntry>();
 const GROUP_INFO_TTL = 5 * 60 * 1000;
 
-export async function getCachedGroupInfo(
+export function getCachedGroupInfo(zaloId: string): { name?: string; avt?: string } | undefined {
+  const hit = _groupInfoCache.get(zaloId);
+  if (!hit || Date.now() - hit.ts >= GROUP_INFO_TTL) return undefined;
+  return hit;
+}
+
+export async function refreshCachedGroupInfo(
   api: ZaloAPI,
   zaloId: string,
 ): Promise<{ name?: string; avt?: string }> {
-  const hit = _groupInfoCache.get(zaloId);
-  if (hit && Date.now() - hit.ts < GROUP_INFO_TTL) return hit;
   try {
     const info = await runZaloRequest(
       { label: `getCachedGroupInfo(${zaloId})`, priority: 'low', maxRetries: 0 },
@@ -174,6 +178,12 @@ export async function isMutedZaloGroup(api: ZaloAPI, groupId: string): Promise<b
 
 const USER_LOOKUP_RATE_LIMIT_COOLDOWN_MS = 60_000;
 const userLookupBlockedUntil = new Map<string, number>();
+
+export function getCachedUserDisplayName(uid: string | undefined, fallback = 'ai đó'): string {
+  const cleanUid = uid?.trim();
+  if (!cleanUid) return fallback;
+  return userCache.getName(cleanUid)?.trim() || fallback.trim() || cleanUid;
+}
 
 export async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fallback = 'ai đó'): Promise<string> {
   const cleanUid = uid?.trim();
