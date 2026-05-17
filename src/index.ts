@@ -108,15 +108,15 @@ async function pruneLeftGroupTopics(api: ZaloAPI): Promise<void> {
   }
 }
 
-function scheduleZaloReconnect(delayMs = reconnectDelayMs): void {
+function scheduleZaloReconnect(delayMs = reconnectDelayMs, notifyTelegram = true): void {
   if (shuttingDown || reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    void reconnectZalo();
+    void reconnectZalo(notifyTelegram);
   }, delayMs);
 }
 
-async function reconnectZalo(): Promise<void> {
+async function reconnectZalo(notifyTelegram = true): Promise<void> {
   if (shuttingDown || reconnecting) return;
   stopZaloWatchdog();
   reconnecting = true;
@@ -126,17 +126,21 @@ async function reconnectZalo(): Promise<void> {
     const newApi = await getZaloApi();
     await startZalo(newApi, true);
     reconnectDelayMs = 5_000;
-    tgBot.telegram.sendMessage(config.telegram.groupId, 'Zalo đã kết nối lại.').catch(() => undefined);
+    if (notifyTelegram) {
+      tgBot.telegram.sendMessage(config.telegram.groupId, 'Zalo đã kết nối lại.').catch(() => undefined);
+    }
     console.log('[Boot] Zalo reconnected ✓');
   } catch (err) {
     reconnectDelayMs = Math.min(reconnectDelayMs * 2, 60_000);
     console.error('[Boot] Zalo reconnect failed:', err);
-    tgBot.telegram.sendMessage(
-      config.telegram.groupId,
-      `Kết nối lại Zalo thất bại. Sẽ thử lại sau ${Math.round(reconnectDelayMs / 1000)} giây. Dùng <b>/login</b> nếu phiên đã hết hạn.`,
-      { parse_mode: 'HTML' },
-    ).catch(() => undefined);
-    scheduleZaloReconnect(reconnectDelayMs);
+    if (notifyTelegram) {
+      tgBot.telegram.sendMessage(
+        config.telegram.groupId,
+        `Kết nối lại Zalo thất bại. Sẽ thử lại sau ${Math.round(reconnectDelayMs / 1000)} giây. Dùng <b>/login</b> nếu phiên đã hết hạn.`,
+        { parse_mode: 'HTML' },
+      ).catch(() => undefined);
+    }
+    scheduleZaloReconnect(reconnectDelayMs, notifyTelegram);
   } finally {
     reconnecting = false;
   }
@@ -155,8 +159,8 @@ function startZaloWatchdog(api: ZaloAPI): void {
     if (shuttingDown || reconnecting || api !== activeZaloApi) return;
     const idleMs = Date.now() - lastZaloEventAt;
     if (idleMs < 5 * 60_000) return;
-    console.warn(`[Boot] Zalo listener idle for ${Math.round(idleMs / 1000)}s, reconnecting...`);
-    void reconnectZalo();
+    console.warn(`[Boot] Zalo listener idle for ${Math.round(idleMs / 1000)}s, reconnecting silently...`);
+    void reconnectZalo(false);
   }, 60_000);
 }
 
