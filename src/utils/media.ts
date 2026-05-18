@@ -43,10 +43,23 @@ function runTgsConversionExclusive<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
+let _ffmpegPathCache: string | null | undefined;
+
 function getFfmpegPath(): string {
-  const ffmpegPath = require('ffmpeg-static') as string | null;
-  if (!ffmpegPath) throw new Error('ffmpeg-static did not provide a binary path');
-  return ffmpegPath;
+  if (_ffmpegPathCache === undefined) {
+    try {
+      _ffmpegPathCache = require('ffmpeg-static') as string | null;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'MODULE_NOT_FOUND') {
+        _ffmpegPathCache = null;
+        throw new Error('ffmpeg-static not installed; run `npm install` to enable sticker→GIF');
+      }
+      throw err;
+    }
+  }
+  if (!_ffmpegPathCache) throw new Error('ffmpeg-static unavailable');
+  return _ffmpegPathCache;
 }
 
 const CHILD_PROCESS_TIMEOUT_MS = 120_000;

@@ -497,7 +497,7 @@ export function registerMessageHandler({ bot, getApi }: TgHandlerContext): void 
           console.log(`[TG→Zalo] ${sticker.is_video ? 'Video' : (sticker.is_animated ? 'Animated' : 'Static')} sticker converted to GIF and sent`);
           return;
         } catch (err) {
-          console.error('[TG→Zalo] Sticker→GIF failed, falling back to thumbnail:', err);
+          console.warn('[TG→Zalo] Sticker→GIF failed, falling back to thumbnail:', (err as Error).message);
         } finally {
           if (sourcePath) await cleanTemp(sourcePath);
           if (rawGifPath && rawGifPath !== gifPath) await cleanTemp(rawGifPath);
