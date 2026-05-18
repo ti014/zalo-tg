@@ -76,8 +76,7 @@ async function shutdown(signal: string, exitCode = 0): Promise<void> {
 }
 
 process.on('unhandledRejection', (reason) => {
-  console.error('[Boot] Unhandled rejection — exiting:', reason);
-  void shutdown('unhandledRejection', 1);
+  console.error('[Boot] Unhandled rejection (continuing):', reason);
 });
 process.on('uncaughtException', (err) => {
   console.error('[Boot] Uncaught exception — exiting:', err);
@@ -158,7 +157,7 @@ function startZaloWatchdog(api: ZaloAPI): void {
   watchdogTimer = setInterval(() => {
     if (shuttingDown || reconnecting || api !== activeZaloApi) return;
     const idleMs = Date.now() - lastZaloEventAt;
-    if (idleMs < 5 * 60_000) return;
+    if (idleMs < 10 * 60_000) return;
     console.warn(`[Boot] Zalo listener idle for ${Math.round(idleMs / 1000)}s, reconnecting silently...`);
     void reconnectZalo(false);
   }, 60_000);

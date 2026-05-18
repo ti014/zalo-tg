@@ -19,6 +19,16 @@ interface MediaGroupBuffer {
 
 const _mgBuffers = new Map<string, MediaGroupBuffer>();
 
+function safeFlush(label: string, fn: () => unknown): void {
+  try {
+    Promise.resolve(fn()).catch(err => {
+      console.error(`[${label}] flush failed:`, (err as Error)?.message ?? err);
+    });
+  } catch (err) {
+    console.error(`[${label}] flush threw:`, (err as Error)?.message ?? err);
+  }
+}
+
 export const mediaGroupStore = {
   add(
     groupId: string,
@@ -32,7 +42,7 @@ export const mediaGroupStore = {
       existing.items.push(item);
       existing.timer = setTimeout(() => {
         _mgBuffers.delete(groupId);
-        onFlush(existing.items, existing);
+        safeFlush('mediaGroupStore', () => onFlush(existing.items, existing));
       }, 500);
     } else {
       const buf: MediaGroupBuffer = {
@@ -40,7 +50,7 @@ export const mediaGroupStore = {
         items: [item],
         timer: setTimeout(() => {
           _mgBuffers.delete(groupId);
-          onFlush(buf.items, buf);
+          safeFlush('mediaGroupStore', () => onFlush(buf.items, buf));
         }, 500),
       };
       _mgBuffers.set(groupId, buf);
@@ -75,7 +85,7 @@ export const zaloAlbumStore = {
       existing.zaloMsgIds.push(msgId);
       existing.timer = setTimeout(() => {
         _zaloAlbumBuffers.delete(key);
-        onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta });
+        safeFlush('zaloAlbumStore', () => onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta }));
       }, 200);
     } else {
       const buf: ZaloAlbumBuffer = {
@@ -84,7 +94,7 @@ export const zaloAlbumStore = {
         zaloMsgIds: [msgId],
         timer: setTimeout(() => {
           _zaloAlbumBuffers.delete(key);
-          onFlush({ urls: buf.urls, zaloMsgIds: buf.zaloMsgIds, ...meta });
+          safeFlush('zaloAlbumStore', () => onFlush({ urls: buf.urls, zaloMsgIds: buf.zaloMsgIds, ...meta }));
         }, 200),
       };
       _zaloAlbumBuffers.set(key, buf);
