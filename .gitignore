@@ -6,6 +6,8 @@ dist/
 
 # Environment & secrets — KHÔNG commit các file này
 .env
+.env.*
+!.env.example
 credentials.json
 *.json.bak
 
@@ -13,6 +15,12 @@ credentials.json
 data/topics.json
 data/*.json
 data/*.lock
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/media/
+data/backups/
+/backups/
 tmp/
 
 # Logs
@@ -26,3 +34,7 @@ npm-debug.log*
 .vscode/
 .idea/
 logs/
+
+# Harness core maintenance binary
+scripts/bin/harness
+scripts/bin/harness.exe

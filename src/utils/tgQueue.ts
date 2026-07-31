@@ -11,11 +11,12 @@ interface QueueItem {
   resolve: (v: unknown) => void;
   reject:  (e: unknown) => void;
   retries: number;
+  timeoutMs: number;
 }
 
 const MAX_RETRIES  = 5;
 const CONCURRENCY  = 5;   // max simultaneous in-flight TG calls
-const TG_CALL_TIMEOUT_MS = 45_000;
+const DEFAULT_TG_CALL_TIMEOUT_MS = 45_000;
 const _queue: QueueItem[] = [];
 let   _active    = 0;
 let   _pauseUntil = 0; // epoch ms — global back-off on 429
@@ -36,12 +37,15 @@ function is429(err: unknown): number | null {
   return null;
 }
 
-function withTimeout<T>(promise: Promise<T>): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
     promise,
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`Telegram API timeout after ${Math.round(TG_CALL_TIMEOUT_MS / 1000)}s`)), TG_CALL_TIMEOUT_MS);
+      timer = setTimeout(() => reject(Object.assign(
+        new Error(`Telegram API timeout after ${Math.round(timeoutMs / 1000)}s`),
+        { code: 'ETIMEDOUT' },
+      )), timeoutMs);
     }),
   ]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -62,7 +66,7 @@ async function runOne(item: QueueItem): Promise<void> {
     const wait = _pauseUntil - Date.now();
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
 
-    const result = await withTimeout(item.fn());
+    const result = await withTimeout(item.fn(), item.timeoutMs);
     item.resolve(result);
   } catch (err) {
     const retryAfter = is429(err);
@@ -82,9 +86,22 @@ async function runOne(item: QueueItem): Promise<void> {
 }
 
 /** Enqueue a Telegram API call. Returns a promise that resolves/rejects when done. */
-export function tgQueue<T>(fn: () => Promise<T>): Promise<T> {
+export function tgQueue<T>(
+  fn: () => Promise<T>,
+  options: { timeoutMs?: number } = {},
+): Promise<T> {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TG_CALL_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new Error('Telegram queue timeoutMs must be a positive safe integer.');
+  }
   return new Promise<T>((resolve, reject) => {
-    _queue.push({ fn: fn as () => Promise<unknown>, resolve: resolve as (v: unknown) => void, reject, retries: 0 });
+    _queue.push({
+      fn: fn as () => Promise<unknown>,
+      resolve: resolve as (v: unknown) => void,
+      reject,
+      retries: 0,
+      timeoutMs,
+    });
     scheduleNext();
   });
 }

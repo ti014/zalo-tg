@@ -1,6 +1,8 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 import { config } from '../config.js';
+import { writeJsonAtomicSync } from '../infrastructure/files/atomic-file.js';
+import { shadowTopicRemove, shadowTopicSet, shadowTopicsReplace } from '../infrastructure/database/shadow-state.js';
 
 export interface TopicEntry {
   topicId: number;
@@ -15,6 +17,9 @@ interface StoreData {
 }
 
 const filePath = path.resolve(config.dataDir, 'topics.json');
+type LoadStatus = 'loaded' | 'missing' | 'invalid';
+let loadStatus: LoadStatus = 'missing';
+let loadFailure: Error | undefined;
 
 function normalize(data: StoreData): StoreData {
   const topics = data.topics ?? {};
@@ -28,17 +33,25 @@ function normalize(data: StoreData): StoreData {
 }
 
 function load(): StoreData {
-  if (!existsSync(filePath)) return { topics: {}, zaloIndex: {} };
+  loadFailure = undefined;
+  if (!existsSync(filePath)) {
+    loadStatus = 'missing';
+    return { topics: {}, zaloIndex: {} };
+  }
   try {
-    return normalize(JSON.parse(readFileSync(filePath, 'utf8')) as StoreData);
-  } catch {
+    const loaded = normalize(JSON.parse(readFileSync(filePath, 'utf8')) as StoreData);
+    loadStatus = 'loaded';
+    return loaded;
+  } catch (error) {
+    loadStatus = 'invalid';
+    loadFailure = new Error(`Cannot load ${filePath}; SQLite recovery is required.`, { cause: error });
+    console.error('[topicStore] Legacy topic file is invalid; deferring to SQLite recovery:', loadFailure);
     return { topics: {}, zaloIndex: {} };
   }
 }
 
 function persist(data: StoreData): void {
-  mkdirSync(path.dirname(filePath), { recursive: true });
-  writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  writeJsonAtomicSync(filePath, data, 2);
 }
 
 function zaloKey(zaloId: string, type: 0 | 1): string {
@@ -57,19 +70,35 @@ export const store = {
   },
 
   set(entry: TopicEntry): void {
+    if (!Number.isSafeInteger(entry.topicId) || entry.topicId <= 1) {
+      throw new Error(`Invalid Telegram forum topic ID: ${entry.topicId}`);
+    }
+    const key = zaloKey(entry.zaloId, entry.type);
+    const previousTopicId = _data.zaloIndex[key];
+    if (previousTopicId !== undefined && previousTopicId !== entry.topicId) {
+      delete _data.topics[String(previousTopicId)];
+    }
+    const previousAtTopic = _data.topics[String(entry.topicId)];
+    if (previousAtTopic) {
+      delete _data.zaloIndex[zaloKey(previousAtTopic.zaloId, previousAtTopic.type)];
+    }
     _data.topics[String(entry.topicId)] = entry;
-    _data.zaloIndex[zaloKey(entry.zaloId, entry.type)] = entry.topicId;
+    _data.zaloIndex[key] = entry.topicId;
     persist(_data);
+    shadowTopicSet(entry);
   },
 
   all(): TopicEntry[] {
     return Object.values(_data.topics);
   },
 
-  replaceAll(entries: TopicEntry[]): number {
+  replaceAll(
+    entries: TopicEntry[],
+    options: { synchronizeShadow?: boolean } = {},
+  ): number {
     const topics: Record<string, TopicEntry> = {};
     for (const entry of entries) {
-      if (!Number.isFinite(entry.topicId)) continue;
+      if (!Number.isSafeInteger(entry.topicId) || entry.topicId <= 1) continue;
       if (entry.type !== 0 && entry.type !== 1) continue;
       if (!entry.zaloId?.trim() || !entry.name?.trim()) continue;
       topics[String(entry.topicId)] = {
@@ -81,6 +110,11 @@ export const store = {
     }
     _data = normalize({ topics, zaloIndex: {} });
     persist(_data);
+    loadStatus = 'loaded';
+    loadFailure = undefined;
+    if (options.synchronizeShadow !== false) {
+      shadowTopicsReplace(Object.values(_data.topics));
+    }
     return Object.keys(_data.topics).length;
   },
 
@@ -94,10 +128,15 @@ export const store = {
     }
 
     persist(_data);
+    shadowTopicRemove(topicId);
     return entry;
   },
 
   reload(): void {
     _data = load();
+  },
+
+  loadState(): { status: LoadStatus; error?: Error } {
+    return { status: loadStatus, ...(loadFailure ? { error: loadFailure } : {}) };
   },
 };

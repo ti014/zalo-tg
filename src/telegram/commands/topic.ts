@@ -31,6 +31,15 @@ export function registerTopicCommand({ bot }: TgHandlerContext): void {
       return;
     }
 
+    if (arg === 'clear') {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        'Dùng <code>/clear</code> để xem phạm vi và <code>/clear confirm</code> để xóa toàn bộ mapping của group hiện tại.',
+        { ...replyOpts, parse_mode: 'HTML' },
+      );
+      return;
+    }
+
     if (!topicId) {
       await ctx.telegram.sendMessage(
         config.telegram.groupId,
@@ -75,7 +84,7 @@ export function registerTopicCommand({ bot }: TgHandlerContext): void {
 
     await ctx.telegram.sendMessage(
       config.telegram.groupId,
-      '❓ Dùng: <code>/topic list</code> | <code>/topic info</code> | <code>/topic delete</code>',
+      'Dùng: <code>/topic list</code> | <code>/topic info</code> | <code>/topic delete</code> | <code>/clear</code>',
       { ...replyOpts, parse_mode: 'HTML' },
     );
   });

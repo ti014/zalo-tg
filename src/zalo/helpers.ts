@@ -3,16 +3,34 @@ import type { ZaloAPI, ZaloMediaContent, ZaloGroupInfoResponse } from './types.j
 import { isZaloRateLimitError, runZaloRequest } from './rate-limit.js';
 import { userCache } from '../store/index.js';
 import { tgBot } from '../telegram/bot.js';
-import { config } from '../config.js';
 import { escapeHtml } from '../utils/format.js';
 import { tgQueue } from '../utils/tgQueue.js';
+import { config } from '../config.js';
+
+const TELEGRAM_UPLOAD_METHODS = new Set([
+  'sendAnimation',
+  'sendAudio',
+  'sendDocument',
+  'sendMediaGroup',
+  'sendPhoto',
+  'sendSticker',
+  'sendVideo',
+  'sendVoice',
+]);
 
 export const tg = new Proxy(tgBot.telegram, {
   get(target, prop: string) {
     const orig = (target as unknown as Record<string, unknown>)[prop];
     if (typeof orig !== 'function') return orig;
     return (...args: unknown[]) =>
-      tgQueue(() => (orig as (...a: unknown[]) => Promise<unknown>).apply(target, args));
+      tgQueue(
+        () => (orig as (...a: unknown[]) => Promise<unknown>).apply(target, args),
+        {
+          ...(TELEGRAM_UPLOAD_METHODS.has(prop)
+            ? { timeoutMs: config.telegram.uploadTimeoutMs }
+            : {}),
+        },
+      );
   },
 }) as typeof tgBot.telegram;
 
@@ -128,52 +146,6 @@ export async function refreshCachedGroupInfo(
     _groupInfoCache.set(zaloId, entry);
     return entry;
   } catch { return {}; }
-}
-
-interface ZaloMuteEntry {
-  id: string;
-  duration: number;
-  startTime: number;
-  systemTime?: number;
-  currentTime?: number;
-}
-
-const MUTED_GROUPS_TTL = 60 * 1000;
-let _mutedGroupsCache: { ids: Set<string>; ts: number } | null = null;
-
-function isActiveMute(entry: ZaloMuteEntry): boolean {
-  if (entry.duration === -1) return true;
-  if (entry.duration <= 0) return false;
-
-  const now = entry.currentTime ?? entry.systemTime ?? Math.floor(Date.now() / 1000);
-  const expiresAt = entry.startTime + entry.duration;
-  return now < expiresAt;
-}
-
-export async function isMutedZaloGroup(api: ZaloAPI, groupId: string): Promise<boolean> {
-  if (!config.zalo.skipMutedGroups) return false;
-
-  const cached = _mutedGroupsCache;
-  if (cached && Date.now() - cached.ts < MUTED_GROUPS_TTL) {
-    return cached.ids.has(groupId);
-  }
-
-  try {
-    const muteInfo = await runZaloRequest(
-      { label: 'getMute()', priority: 'low', maxRetries: 0 },
-      () => api.getMute(),
-    ) as { groupChatEntries?: ZaloMuteEntry[] };
-    const mutedIds = new Set(
-      (muteInfo.groupChatEntries ?? [])
-        .filter(isActiveMute)
-        .map(entry => String(entry.id)),
-    );
-    _mutedGroupsCache = { ids: mutedIds, ts: Date.now() };
-    return mutedIds.has(groupId);
-  } catch (err) {
-    console.warn('[Zalo→TG] Failed to check muted Zalo groups; forwarding message:', err);
-    return false;
-  }
 }
 
 const USER_LOOKUP_RATE_LIMIT_COOLDOWN_MS = 60_000;

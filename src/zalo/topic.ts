@@ -6,6 +6,8 @@ import { config } from '../config.js';
 import { downloadToTemp, cleanTemp } from '../utils/media.js';
 import { topicName, escapeHtml } from '../utils/format.js';
 import { tg } from './helpers.js';
+import { isTopicUnavailableError } from '../domain/topic-errors.js';
+import { sendWithOneTopicRetry } from '../domain/topic-retry.js';
 
 const _pendingTopics = new Map<string, Promise<number>>();
 
@@ -51,8 +53,7 @@ export async function getOrCreateTopic(
 }
 
 export function isTopicDeletedError(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return msg.includes('message thread not found') || msg.includes('TOPIC_CLOSED') || msg.includes('thread not found');
+  return isTopicUnavailableError(err);
 }
 
 export async function sendWithTopicRecovery<T>(
@@ -62,16 +63,19 @@ export async function sendWithTopicRecovery<T>(
   avatarUrl: string | undefined,
   sendFn: (topicId: number) => Promise<T>,
   currentTopicId: number,
+  onRecovered?: (topicId: number) => void,
 ): Promise<T> {
-  try {
-    return await sendFn(currentTopicId);
-  } catch (err) {
-    if (!isTopicDeletedError(err)) throw err;
-    console.warn(`[Zalo→TG] Topic ${currentTopicId} deleted — removing mapping and recreating for ${zaloId}`);
-    store.remove(currentTopicId);
-    const newTopicId = await getOrCreateTopic(zaloId, type, displayName, avatarUrl, true);
-    return sendFn(newTopicId);
-  }
+  return sendWithOneTopicRetry({
+    topicId: currentTopicId,
+    send: sendFn,
+    isUnavailable: isTopicDeletedError,
+    recover: async staleTopicId => {
+      console.warn(`[Zalo→TG] Topic ${staleTopicId} deleted — removing mapping and recreating for ${zaloId}`);
+      store.remove(staleTopicId);
+      return getOrCreateTopic(zaloId, type, displayName, avatarUrl, true);
+    },
+    onRecovered,
+  });
 }
 
 async function doCreateTopic(
@@ -96,10 +100,13 @@ async function doCreateTopic(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes('not enough rights') || msg.includes('TOPIC_') || msg.includes('rights to manage')) {
-      console.error(`[Zalo→TG] Cannot create topic — bot lacks "Manage Topics" admin right. Falling back to General topic.`);
-      const fallbackId = 1;
-      store.set({ topicId: fallbackId, zaloId, type, name: displayName });
-      return fallbackId;
+      throw Object.assign(
+        new Error(
+          'Telegram bot lacks the Manage Topics permission; refusing General-topic fallback.',
+          { cause: err },
+        ),
+        { code: 'TELEGRAM_MANAGE_TOPICS_REQUIRED' },
+      );
     }
     throw err;
   }

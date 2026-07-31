@@ -1,264 +1,349 @@
-*Vietnamese version: [README.vi.md](README.vi.md)*
+<a href="README.md"><img src="https://flagcdn.com/20x15/us.png" alt="English" width="20" height="15"> English</a> · <a href="README.vi.md"><img src="https://flagcdn.com/20x15/vn.png" alt="Tiếng Việt" width="20" height="15"> Tiếng Việt</a>
 
+<hr>
 
 # zalo-tg
 
-## Setup Video
+A bidirectional Zalo–Telegram bridge. Every Zalo direct conversation or group is mapped to a Forum Topic in one Telegram supergroup; messages, media, replies, reactions, recalls, polls, and selected group events are synchronized in both directions.
 
-<video src="REC-20260510162634.mp4" controls width="100%"></video>
+The bridge runs as one long-lived Node.js process. SQLite and a Docker named volume preserve state, media, mappings, and queued deliveries across restarts, upgrades, and controlled restore operations.
 
-A bidirectional message bridge between **Zalo** and **Telegram**, implemented in TypeScript on Node.js. Each Zalo conversation (direct message or group) is mapped to a dedicated Forum Topic inside a Telegram supergroup, providing full message synchronisation across both platforms.
+## Key features
 
----
+- Bidirectional text and media relay with automatic Forum Topic mapping.
+- Synchronization of replies, mentions, reactions, recalls, contacts, locations, polls, and selected group events.
+- Durable SQLite inbox and delivery queue with FIFO ordering per conversation.
+- At-least-once delivery, retry, leases, provider receipts, and operator-visible `UNKNOWN` results.
+- Durable media spool with size limits, expiry cleanup, and multipart Telegram uploads.
+- QR-based Zalo authentication through Telegram.
+- Deployment preflight, SQLite instance lease, liveness, and readiness checks.
+- Hardened Docker runtime: non-root user, read-only root filesystem, dropped capabilities, resource limits, and an external named volume.
 
-## Table of Contents
+## Table of contents
 
+- [Tech stack](#tech-stack)
+- [Prerequisites](#prerequisites)
+- [Getting started](#getting-started)
 - [Architecture](#architecture)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
 - [Configuration](#configuration)
-- [Running](#running)
-- [Bot Commands](#bot-commands)
-- [Project Structure](#project-structure)
-- [Security Considerations](#security-considerations)
-- [License](#license)
+- [Telegram commands](#telegram-commands)
+- [Scripts and testing](#scripts-and-testing)
+- [Deployment and operations](#deployment-and-operations)
+- [Troubleshooting](#troubleshooting)
+- [Security](#security)
+- [Project structure](#project-structure)
+- [Contributing and license](#contributing-and-license)
 
----
+## Tech stack
+
+| Area | Technology |
+| --- | --- |
+| Language | TypeScript, ES2022, strict mode |
+| Runtime | Node.js 24 production image; Node.js 18+ for local development |
+| Telegram | Telegraf and Bot API long polling |
+| Zalo | `zca-js` |
+| Persistence | SQLite via `better-sqlite3`, WAL mode, versioned migrations |
+| Media | FFmpeg, Chromium/Puppeteer, `image-size`, durable media spool |
+| Build | TypeScript compiler and `tsx` |
+| Deployment | Docker Compose; legacy systemd unit included |
+
+## Prerequisites
+
+- Node.js 18+ and npm 9+ for local development.
+- FFmpeg on `PATH` for voice and media conversion. The production image includes it.
+- A Telegram bot created with [@BotFather](https://t.me/BotFather).
+- A private Telegram supergroup with Forum Topics enabled. The bot must be an administrator with **Manage Topics**, **Delete Messages**, **Pin Messages**, and reaction access.
+- An active Zalo account. Its session is stored in `credentials.json` or the configured credentials path.
+- Docker Engine and Docker Compose v2 for the recommended production setup.
+
+## Getting started
+
+### 1. Install dependencies
+
+~~~bash
+git clone <repository-url>
+cd zalo-tg-refactor
+npm ci
+~~~
+
+`npm ci` uses the lockfile and installs native dependencies required by `better-sqlite3`.
+
+### 2. Configure the bridge
+
+~~~powershell
+Copy-Item .env.example .env
+~~~
+
+Set at least these values in `.env`:
+
+~~~dotenv
+TG_TOKEN=replace-with-telegram-bot-token
+TG_GROUP_ID=-1001234567890
+TG_OWNER_IDS=123456789,987654321
+~~~
+
+`TG_GROUP_ID` must be a negative supergroup ID. Each `TG_OWNER_IDS` value must be a positive numeric Telegram user ID. Do not commit `.env`, `credentials.json`, SQLite files, or backups.
+
+### 3. Run locally
+
+~~~bash
+npm run dev
+~~~
+
+This command runs `src/index.ts` with `tsx watch`. On first use, send `/login` in the configured Telegram group and scan the QR code using the Zalo mobile app.
+
+~~~bash
+npm run build
+npm start
+~~~
+
+The second sequence compiles to `dist/` and runs the production entrypoint.
+
+### 4. Run with Docker Compose
+
+~~~powershell
+docker volume create zalo-tg-data
+docker compose config --quiet
+docker compose build --pull bridge
+docker compose up -d --no-build bridge
+docker compose ps
+docker compose logs --tail=200 bridge
+~~~
+
+The service does not publish a host port because it uses Telegram long polling. Persistent data is mounted at `/app/data` from external volume `zalo-tg-data`. To import existing repository data into a new volume exactly once:
+
+~~~powershell
+npm run docker:seed
+~~~
+
+### 5. Verify the deployment
+
+~~~powershell
+docker compose exec -T bridge node dist/runtime/healthcheck.js
+docker compose exec -T bridge node dist/runtime/healthcheck.js --readiness
+~~~
+
+Expected output is `alive` and then `ready`. Also send one test message in each direction before accepting a deployment.
 
 ## Architecture
 
-The bridge operates as a single long-running Node.js process that simultaneously maintains:
+### Runtime flow
 
-1. **A Telegram bot** (via [Telegraf](https://github.com/telegraf/telegraf)) connected to the Bot API using long polling.
-2. **A Zalo client** (via [zca-js](https://github.com/VolunteerSVD/zca-js)) connected to Zalo's internal WebSocket API.
+~~~text
+Telegram update (long polling) ─┐
+                                ├─ handlers ─ durable SQLite inbox/queue ─ provider API
+Zalo listener event ────────────┘                                  │
+                                                                   └─ message/topic mappings
+~~~
 
-Both sides communicate through a set of in-memory and on-disk stores that maintain bidirectional mappings between Telegram message IDs and Zalo message IDs. This enables features such as reply chaining, message recall, and reaction forwarding.
+Startup validates configuration, opens SQLite, applies checksummed migrations, imports legacy JSON where needed, hydrates compatibility stores, recovers stale media downloads, acquires a single-instance lease, and starts durable workers. Telegram permissions are checked before Zalo relay starts. If Zalo is not authenticated, Telegram stays available and the operator can run `/login`.
 
-```
- Zalo WebSocket API
-        |
-   zalo/client.ts         (authentication, session management)
-        |
-   zalo/handler.ts        (decode incoming Zalo events → Telegram)
-        |
-   store.ts               (msgStore, sentMsgStore, pollStore,
-        |                  mediaGroupStore, zaloAlbumStore,
-        |                  userCache, friendsCache, topicStore)
-        |
-   telegram/handler.ts    (decode incoming Telegram updates → Zalo)
-        |
-   Telegram Bot API (long polling)
-```
+### Durability and recovery
 
-**Topic mapping** (`data/topics.json`) is persisted to disk. All message-ID mappings are kept in memory with LRU-style eviction and are lost on process restart (graceful degradation: reply chains to old messages simply omit the `reply_parameters` field).
+- SQLite is the recovery source for topic/message links, aliases, settings, delivery attempts, receipts, media objects, and operator actions.
+- Delivery states are `READY`, `SENDING`, `RETRY`, `SENT`, `SKIPPED`, `UNKNOWN`, and `PERMANENT_FAILED`.
+- The bridge is **at least once**, not exactly once. A request that may have reached a provider before a crash becomes `UNKNOWN` rather than being blindly replayed.
+- FIFO ordering is preserved per conversation. Use `/queue` to inspect queued, retrying, and uncertain deliveries.
+- Legacy `topics.json`, `settings.json`, and `msg-map.json` are imported and can be atomically rehydrated from SQLite.
 
----
+### Persistent layout
 
-## Features
+~~~text
+/app/data/
+├── bridge.db                 # SQLite database; WAL can add -wal and -shm
+├── credentials.json          # Zalo session secret
+├── topics.json               # legacy compatibility state
+├── settings.json             # legacy compatibility state
+├── msg-map.json              # legacy compatibility state
+├── media/                    # durable media objects
+└── backups/                  # application backup artifacts, if enabled
+~~~
 
-### Message Types — Zalo to Telegram
-
-| Zalo type (`msgType`) | Telegram output |
-|---|---|
-| `webchat` (plain text) | `sendMessage` with HTML parse mode; mentions wrapped in `<b>` |
-| `chat.photo` | `sendPhoto` (single) or `sendMediaGroup` (album, buffered 600 ms) |
-| `chat.video.msg` | `sendVideo` |
-| `chat.gif` | `sendAnimation` |
-| `share.file` | `sendDocument` with original filename |
-| `chat.voice` | `sendVoice` |
-| `chat.sticker` | `sendSticker` (WebP); falls back to `sendPhoto` if oversized |
-| `chat.doodle` | `sendPhoto` |
-| `chat.recommended` (link) | `sendMessage` with inline link preview |
-| `chat.location.new` | `sendLocation` (native map widget) |
-| `chat.webcontent` — bank card | `sendPhoto` with VietQR image + account details |
-| `chat.webcontent` — generic | `sendMessage` with icon and label |
-| contact card (contactUid) | `sendPhoto` with QR code + name/ID, or `sendMessage` fallback |
-| `group.poll` — create | `sendPoll` + editable score message with lock button |
-| `group.poll` — vote update | Edit score message with updated vote counts and bar chart |
-
-### Message Types — Telegram to Zalo
-
-| Telegram content | Zalo API call |
-|---|---|
-| Text | `sendMessage` |
-| Photo (single) | `sendMessage` with attachment |
-| Photo album (media group) | `sendMessage` with multiple attachments (buffered 500 ms) |
-| Video (single) | `sendMessage` with attachment |
-| Video album (media group) | `sendMessage` with multiple attachments (buffered 500 ms) |
-| Animation / GIF | `sendMessage` with attachment |
-| Document | `sendMessage` with attachment |
-| Voice note (OGG Opus) | Convert to M4A via ffmpeg → `uploadAttachment` → `sendVoice` |
-| Sticker (static WebP) | `sendMessage` with attachment |
-| Sticker (animated / video) | Downloads JPEG thumbnail → `sendMessage` with attachment |
-| Location | `sendLink` with Google Maps URL; fallback to `sendMessage` |
-| Contact | `sendMessage` with name and phone number |
-| Poll | `createPoll` on Zalo + bot-owned non-anonymous clone poll on Telegram |
-
-### Interaction Sync
-
-**Reply chain** — When a Telegram message has `reply_to_message`, the bridge resolves the target to a Zalo `quote` object and passes it to `sendMessage`. Replies to messages originally sent from Telegram to Zalo are resolved via a reverse index in `sentMsgStore`.
-
-**Reactions** — Telegram `message_reaction` updates are mapped through a static emoji table and forwarded via `addReaction`. Zalo reactions are forwarded as a short text reply on Telegram.
-
-**Message recall (undo)** — Zalo `undo` events trigger `deleteMessage` on the mirrored Telegram message. The `/recall` command triggers `api.undo` for messages the bot itself sent.
-
-**Mentions** — Zalo `@mention` spans are wrapped in `<b>` tags on Telegram. Telegram `@username` entities and plain-text `@Name` patterns are resolved to Zalo UIDs via `userCache` and forwarded as `mentions` in `sendMessage`. Captions on photos, videos, and documents are also mention-resolved.
-
-### Poll Synchronisation
-
-- Zalo poll creation → Telegram native poll + editable score message with inline lock button.
-- Telegram poll creation → Zalo `createPoll` + bot-owned non-anonymous clone poll (required for `poll_answer` updates) + editable score message.
-- `poll_answer` events (Telegram side) → `votePoll` on Zalo + immediate score refresh via `getPollDetail`.
-- Zalo votes trigger `group_event` with `boardType=3` → `getPollDetail` → score message edit.
-- Lock button / `stopPoll` → `lockPoll` on Zalo, `stopPoll` on both TG polls, score message updated to show closed state.
-
-### Group Management
-
-- New Zalo group conversation → Forum Topic created automatically on first message received, with the group avatar fetched and pinned as the first message.
-- Group events (join, leave, remove, block) forwarded as italic system messages inside the topic.
-
----
-
-## Requirements
-
-| Dependency | Version | Notes |
-|---|---|---|
-| Node.js | >= 18 | ESM support required |
-| npm | >= 9 | |
-| ffmpeg | any | Must be in `PATH`; used for OGG→M4A voice conversion |
-| Telegram Bot | — | Created via [@BotFather](https://t.me/BotFather) |
-| Telegram Supergroup | — | Forum (Topics) mode enabled; bot must be admin |
-| Zalo account | — | Active account; session stored in `credentials.json` |
-
-**Required bot admin permissions in the Telegram supergroup:**
-- Manage topics (create, edit)
-- Delete messages
-- Pin messages
-- Manage the group (for reactions via `message_reaction` updates)
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/williamcachamwri/zalo-tg
-cd zalo-tg
-npm install
-cp .env.example .env
-```
-
----
+The health heartbeat is stored at `/tmp/health/health.json` in production. Readiness requires `storage`, `telegram`, and `zalo` all to be `ready`; Compose's healthcheck tests liveness only.
 
 ## Configuration
 
-Edit `.env`:
+Copy `.env.example` to `.env`. Invalid required IDs, booleans, numbers, or production paths fail fast at startup.
 
-```env
-# Telegram Bot token from @BotFather
-TG_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+### Required
 
-# Telegram supergroup ID (negative integer, e.g. -1001234567890)
-TG_GROUP_ID=-1001234567890
+| Variable | Description | Example |
+| --- | --- | --- |
+| `TG_TOKEN` | BotFather token | `123456:replace-me` |
+| `TG_GROUP_ID` | Destination supergroup ID; negative | `-1001234567890` |
+| `TG_OWNER_IDS` | Privileged user IDs, comma/space separated | `123456789,987654321` |
 
-# Directory for persistent data (topics.json, credentials.json)
-# Defaults to ./data if omitted
-DATA_DIR=./data
+### Runtime and storage
 
-# Skip forwarding messages from muted Zalo groups
-# Defaults to false; set to true/1/yes/on to enable
-ZALO_SKIP_MUTED_GROUPS=false
-```
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATA_DIR` | `./data` locally; `/app/data` in Docker | Root for application state |
+| `DATABASE_PATH` | `<DATA_DIR>/bridge.db` | SQLite database; production path must remain inside `DATA_DIR` |
+| `ZALO_CREDENTIALS_PATH` | local `credentials.json`; Docker `/app/data/credentials.json` | Zalo session; production path must remain inside `DATA_DIR` |
+| `HEALTH_DIR` | `DATA_DIR` | Directory containing `health.json` |
+| `BRIDGE_DATA_VOLUME` | `zalo-tg-data` | External Docker volume |
+| `BRIDGE_IMAGE` | `zalo-tg-bridge:local` | Docker image reference |
+| `BUILD_REVISION` | `local-dirty` | OCI revision label |
+| `BUILD_VERSION` | `1.0.0` | OCI version label |
 
----
+### Limits and feature flags
 
-## Running
+| Variable | Default | Limit or effect |
+| --- | ---: | --- |
+| `TG_DOWNLOAD_MAX_MB` | 20 | Maximum 200 MB |
+| `TG_UPLOAD_PART_MB` | 45 | Maximum 200 MB |
+| `TG_UPLOAD_TIMEOUT_SEC` | 600 | Maximum 3600 seconds |
+| `MEDIA_MAX_OBJECT_MB` | 200 | Maximum 2048 MB |
+| `MEDIA_SPOOL_MAX_MB` | 5120 | Maximum 102400 MB |
+| `DELIVERY_SENT_RETENTION_DAYS` | 90 | Maximum 3650 days |
+| `DATA_MIN_FREE_MB` | 512 | Minimum free storage guard |
+| `ZALO_SKIP_MUTED_GROUPS` | false | Skip messages from muted groups |
+| `ZALO_SKIP_STRANGER_MESSAGES` | false | Skip DMs from non-friends |
+| `UPDATE_CHECK_ENABLED` | false in production | Enable update notifications |
+| `ALLOW_SECRET_BACKUP` | false | Permit backups containing secrets |
+| `TG_API_ROOT` | unset | Optional custom Bot API root; read `docs/operations.md` first |
 
-```bash
-# Development — hot reload via tsx watch
-npm run dev
+Boolean values accept `1/true/yes/on` and `0/false/no/off`.
 
-# Production
-npm run build
-npm start
-```
+## Telegram commands
 
-On first run with no existing `credentials.json`, send `/login` inside any topic (or the General topic) of the bridged Telegram group. The bot will send a Zalo QR code image; scan it with the Zalo mobile app under **Settings → QR Code Login**.
+| Command | Purpose |
+| --- | --- |
+| `/login` | Start QR-based Zalo login |
+| `/status` | Show bridge and provider status |
+| `/topic list\|info\|delete` | Inspect or remove topic mappings |
+| `/search <query>` | Search friends and create a direct-message topic |
+| `/addfriend`, `/friendrequests` | Manage Zalo friend requests |
+| `/addgroup`, `/joingroup`, `/leavegroup` | Manage Zalo groups |
+| `/recall` | Recall a bot-originated Zalo message |
+| `/queue` | Inspect queue, retry, and `UNKNOWN` deliveries |
+| `/backup`, `/restore` | Controlled application backup/restore flows |
+| `/settings`, `/members`, `/kick`, `/clear` | Administrative operations |
+| `/help`, `/menu` | Show the current command catalog |
 
----
+Privileged actions are restricted by `TG_OWNER_IDS`. Keep the group private because normal members can still relay messages.
 
-## Bot Commands
+## Scripts and testing
 
 | Command | Description |
-|---|---|
-| `/login` | Initiate Zalo QR code authentication |
-| `/search <query>` | Search Zalo friends list; select a result to create a DM topic |
-| `/recall` | Retract a message sent from Telegram to Zalo (reply to the target message) |
-| `/topic list` | List all active topic–conversation mappings |
-| `/topic info` | Show the Zalo conversation details for the current topic |
-| `/topic delete` | Remove the mapping for the current topic |
+| --- | --- |
+| `npm run dev` | Run TypeScript with hot reload |
+| `npm run build` | Compile `src/` to `dist/` |
+| `npm start` | Run compiled bridge |
+| `npm test` | Run Node-based TypeScript tests |
+| `npm run healthcheck` | Run compiled liveness check |
+| `npm run docker:seed` | Seed Docker volume from repository data |
+| `npm run tgs:gif` | Convert TGS sticker input to GIF |
 
----
+Before deployment:
 
-## Project Structure
+~~~powershell
+npm ci
+npm run build
+npm test
+npm audit --audit-level=high
+npm audit --omit=dev --audit-level=high
+git diff --check
+~~~
 
-```
+Tests cover configuration, migrations and recovery, legacy import, durable relay flows, media spool behavior, authorization, command registration, health, and provider policies.
+
+## Deployment and operations
+
+Docker Compose is the maintained deployment path. The production container runs as UID/GID 10001 with a read-only root filesystem, no Linux capabilities, `no-new-privileges`, a bounded `/tmp`, a 2 GiB memory limit, and a 2 CPU limit.
+
+~~~powershell
+docker compose build --pull --build-arg BUILD_REVISION=$(git rev-parse HEAD) --build-arg BUILD_VERSION=1.0.0 bridge
+docker compose up -d --no-build bridge
+~~~
+
+Do not run two instances on the same volume. The SQLite lease is a safety net, not supported multi-instance coordination.
+
+For development Compose:
+
+~~~powershell
+docker compose -f compose.yaml -f compose.dev.yaml up --build bridge
+~~~
+
+It mounts `src/` read-only, uses `npm run dev`, and stores development state in `zalo-tg-dev-data`.
+
+Read [docs/operations.md](docs/operations.md) before production work. It covers token rotation, first deployment, seed/import, queue handling, backup, restore, rollback, and acceptance checks.
+
+~~~powershell
+./scripts/backup-docker-volume.ps1 -DryRun
+./scripts/backup-docker-volume.ps1
+./scripts/restore-docker-volume.ps1 -ArchivePath .\backups\zalo-tg-data-YYYYMMDD-HHMMSS.tgz -DryRun
+~~~
+
+Backups include credentials, verify SQLite integrity, and write SHA-256 and manifest files. Restore always targets a new volume, verifies the archive and database, and does not edit `.env` or cut over Compose automatically.
+
+## Troubleshooting
+
+### Startup exits
+
+~~~powershell
+docker compose logs --tail=200 bridge
+~~~
+
+Check for missing Telegram variables, an invalid group/owner ID, a production database or credentials path outside `DATA_DIR`, missing Telegram administrator permissions, or another instance using the same volume.
+
+### Liveness passes but readiness fails
+
+~~~powershell
+docker compose exec -T bridge node dist/runtime/healthcheck.js --readiness
+~~~
+
+All components must be ready. `zalo=degraded` usually means Zalo is reconnecting or needs `/login`. Compose does not restart a still-running unhealthy process; use an external supervisor if host-level self-healing is needed.
+
+### A delivery is `UNKNOWN`
+
+Run `/queue` and review its receipts and attempts before retrying. Blind replay can duplicate a message because the provider may already have accepted it.
+
+### Media conversion fails
+
+Check FFmpeg, Chromium, `MEDIA_MAX_OBJECT_MB`, `MEDIA_SPOOL_MAX_MB`, and free space configured by `DATA_MIN_FREE_MB`.
+
+### State appears missing
+
+Confirm the expected named volume is mounted. Never delete the volume as cleanup; restore into a new volume, verify it, then perform a deliberate cutover.
+
+## Security
+
+- Rotate a Telegram token immediately if it appears in a log, diagnostic, screenshot, or chat.
+- Do not commit or share `.env`, `credentials.json`, SQLite files, or backup archives.
+- Use a private Telegram group limited to trusted members.
+- Keep `ALLOW_SECRET_BACKUP=false` unless a documented, access-controlled procedure requires it.
+- Treat `credentials.json` as equivalent to a Zalo account password.
+- Do not expose a public container port; the bridge uses long polling.
+
+## Project structure
+
+~~~text
 src/
-├── index.ts                  Entry point. Initialises Telegraf, Zalo client,
-│                             attaches both handlers, starts polling.
-├── config.ts                 Reads and validates environment variables.
-├── store.ts                  All in-memory and on-disk state:
-│                               - topicStore      (persisted, topics.json)
-│                               - msgStore        (Zalo msgId ↔ TG message_id)
-│                               - sentMsgStore    (TG→Zalo msgId reverse index)
-│                               - pollStore       (poll ↔ TG poll message mapping)
-│                               - mediaGroupStore (TG media group buffer)
-│                               - zaloAlbumStore  (Zalo album buffer)
-│                               - userCache       (uid ↔ displayName)
-│                               - friendsCache    (friends list, 5-min TTL)
-├── telegram/
-│   ├── bot.ts                Telegraf instance; sets allowedUpdates.
-│   └── handler.ts            Processes all Telegram updates and forwards to Zalo.
-│                             Handles: text, media, voice, sticker, poll, location,
-│                             contact, reaction, callback_query, poll_answer.
-├── zalo/
-│   ├── client.ts             Zalo API initialisation and QR login flow.
-│   ├── types.ts              TypeScript interfaces and ZALO_MSG_TYPES constant.
-│   └── handler.ts            Processes all Zalo listener events and forwards to TG.
-│                             Handles: message (all msgTypes), undo, reaction,
-│                             group_event (join/leave/poll/update_board).
-└── utils/
-    ├── format.ts             HTML escaping, mention application, caption helpers.
-    └── media.ts              Temporary file download, cleanup, OGG→M4A conversion.
-```
+├── index.ts                         bootstrap, lifecycle, reconnect, shutdown
+├── config.ts                        environment parsing and validation
+├── application/                     durable Telegram/Zalo relay and media workflows
+├── bootstrap/                       environment and compatibility-store hydration
+├── domain/                          IDs, links, retry, provider and topic errors
+├── infrastructure/database/         SQLite, migrations, repositories, shadow state
+├── infrastructure/files/            atomic file operations
+├── infrastructure/media/            durable media spool
+├── runtime/                         health, healthcheck, redaction, instance lease
+├── store/                           compatibility topic/message/user/poll/settings stores
+├── telegram/                        bot, authorization, handlers, commands, UI
+├── zalo/                            client, listener, handlers, policies
+├── tools/                           Docker seed/verify and TGS conversion
+└── utils/                           format, downloads, media, Telegram queue
+tests/                               Node-based TypeScript tests
+compose*.yaml                        production, development, and seed overlays
+Dockerfile                           multi-stage production image
+docs/operations.md                   production runbook
+scripts/                             PowerShell backup and restore
+~~~
 
----
+## Contributing and license
 
-## Security Considerations
+Before opening a pull request, run `npm run build`, `npm test`, relevant Docker validation, and `git diff --check`. Keep behavior, operations documentation, and tests aligned; never add secrets or generated data.
 
-- `.env` and `credentials.json` are listed in `.gitignore` and must never be committed to version control.
-- `credentials.json` contains a Zalo session token equivalent to the account password. Treat it with the same level of protection.
-- The bridge runs as a single-user system: the Telegram group should be private and restricted to trusted members only, as any member can send messages through the bridge.
-- All outbound HTTP requests to Telegram and Zalo use TLS. No credentials are logged.
-- The `/recall` command is unrestricted within the group — any group member can retract messages the bot sent. Restrict bot admin rights or group membership if this is a concern.
-
----
-
-## Contributors
-
-Thanks to everyone who has contributed to this project.
-
-### Code Contributors
-
-- [@thanhnguyenhy234](https://github.com/thanhnguyenhy234)  
-- [@leolionart](https://github.com/leolionart)  
-
-
-### Want to contribute?
-
-Contributions are welcome!  
-If you want to fix bugs, add features, improve documentation, or suggest improvements, feel free to open a Pull Request.
-
-To get listed here, submit a meaningful contribution through a Pull Request.
-
+No license file is present. Reuse and redistribution require project-owner approval until a license is added.
 

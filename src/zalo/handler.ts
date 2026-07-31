@@ -3,10 +3,11 @@ import { aliasCache } from '../store/index.js';
 import { runZaloRequest } from './rate-limit.js';
 import { registerZaloMessageHandler } from './message-handler.js';
 import { registerZaloEventHandlers } from './event-handlers.js';
+import type { DurableZaloRelay } from '../application/durable-zalo.js';
 
 const wiredApis = new WeakSet<object>();
 
-export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
+export async function setupZaloHandler(api: ZaloAPI, durableRelay?: DurableZaloRelay): Promise<void> {
   if (wiredApis.has(api as object)) return;
   wiredApis.add(api as object);
 
@@ -23,6 +24,6 @@ export async function setupZaloHandler(api: ZaloAPI): Promise<void> {
     console.warn('[Zalo] Failed to load alias list:', err);
   }
 
-  registerZaloMessageHandler(api);
+  registerZaloMessageHandler(api, durableRelay);
   registerZaloEventHandlers(api);
 }

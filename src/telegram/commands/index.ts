@@ -14,6 +14,8 @@ import { registerSettingsCommand } from './settings.js';
 import { registerHelpCommand } from './help.js';
 import { registerBackupCommands } from './backup.js';
 import { registerKickCommand, registerMembersCommand } from './members.js';
+import { registerQueueCommand } from './queue.js';
+import { registerClearCommand } from './clear.js';
 
 export function registerAllCommands(ctx: TgHandlerContext): void {
   registerMenuCommand(ctx);
@@ -32,4 +34,6 @@ export function registerAllCommands(ctx: TgHandlerContext): void {
   registerBackupCommands(ctx);
   registerMembersCommand(ctx);
   registerKickCommand(ctx);
+  registerQueueCommand(ctx);
+  registerClearCommand(ctx);
 }

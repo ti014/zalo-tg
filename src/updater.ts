@@ -1,14 +1,15 @@
-import { execSync } from 'child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type { Telegraf } from 'telegraf';
 
 import { config } from './config.js';
 import { escapeHtml } from './utils/format.js';
+import { writeJsonAtomicSync } from './infrastructure/files/atomic-file.js';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const UPDATE_STATE_FILE = path.resolve(PROJECT_ROOT, 'data', 'update-checker.json');
+const UPDATE_STATE_FILE = path.resolve(config.dataDir, 'update-checker.json');
 
 function loadNotifiedCommit(): string | null {
   if (!existsSync(UPDATE_STATE_FILE)) return null;
@@ -21,24 +22,23 @@ function loadNotifiedCommit(): string | null {
 }
 
 function saveNotifiedCommit(commit: string | null): void {
-  mkdirSync(path.dirname(UPDATE_STATE_FILE), { recursive: true });
-  writeFileSync(UPDATE_STATE_FILE, JSON.stringify({ notifiedCommit: commit }, null, 2), 'utf8');
+  writeJsonAtomicSync(UPDATE_STATE_FILE, { notifiedCommit: commit }, 2);
 }
 
 // Hash of the commit we already sent a notification for (avoid spam)
 let _notifiedCommit: string | null = loadNotifiedCommit();
 
-function gitExec(cmd: string): string {
-  return execSync(cmd, { cwd: PROJECT_ROOT, stdio: 'pipe' }).toString().trim();
+function gitExec(args: string[]): string {
+  return execFileSync('git', args, { cwd: PROJECT_ROOT, stdio: 'pipe' }).toString().trim();
 }
 
 /** Returns the short hash of origin/main if it's ahead of HEAD, else null. */
 function getNewCommit(): string | null {
   try {
-    gitExec('git fetch origin main --quiet');
-    const behind = gitExec('git log HEAD..origin/main --oneline');
+    gitExec(['fetch', 'origin', 'main', '--quiet']);
+    const behind = gitExec(['log', 'HEAD..origin/main', '--oneline']);
     if (!behind) return null;
-    return gitExec('git rev-parse --short origin/main');
+    return gitExec(['rev-parse', '--short', 'origin/main']);
   } catch {
     return null;
   }
@@ -47,7 +47,7 @@ function getNewCommit(): string | null {
 /** Human-readable list of new commits (max 10 lines). */
 function getChangelog(): string {
   try {
-    return gitExec('git log HEAD..origin/main --oneline --no-merges');
+    return gitExec(['log', 'HEAD..origin/main', '--oneline', '--no-merges']);
   } catch {
     return '';
   }

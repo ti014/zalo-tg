@@ -1,6 +1,8 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import path from 'path';
 import { config } from '../config.js';
+import { writeJsonAtomicSync } from '../infrastructure/files/atomic-file.js';
+import { shadowSettingsReplace } from '../infrastructure/database/shadow-state.js';
 
 export interface TelegramUiSettings {
   compactMode: boolean;
@@ -21,6 +23,9 @@ const DEFAULT_SETTINGS: AppSettings = {
 };
 
 const settingsPath = path.resolve(config.dataDir, 'settings.json');
+type LoadStatus = 'loaded' | 'missing' | 'invalid';
+let loadStatus: LoadStatus = 'missing';
+let loadFailure: Error | undefined;
 let settingsData = loadSettings();
 
 function mergeSettings(raw: Partial<AppSettings>): AppSettings {
@@ -33,18 +38,26 @@ function mergeSettings(raw: Partial<AppSettings>): AppSettings {
 }
 
 function loadSettings(): AppSettings {
-  if (!existsSync(settingsPath)) return DEFAULT_SETTINGS;
+  loadFailure = undefined;
+  if (!existsSync(settingsPath)) {
+    loadStatus = 'missing';
+    return DEFAULT_SETTINGS;
+  }
   try {
     const raw = JSON.parse(readFileSync(settingsPath, 'utf8')) as Partial<AppSettings>;
-    return mergeSettings(raw);
-  } catch {
+    const loaded = mergeSettings(raw);
+    loadStatus = 'loaded';
+    return loaded;
+  } catch (error) {
+    loadStatus = 'invalid';
+    loadFailure = new Error(`Cannot load ${settingsPath}; SQLite recovery is required.`, { cause: error });
+    console.error('[settingsStore] Legacy settings file is invalid; deferring to SQLite recovery:', loadFailure);
     return DEFAULT_SETTINGS;
   }
 }
 
 function persistSettings(data: AppSettings): void {
-  mkdirSync(path.dirname(settingsPath), { recursive: true });
-  writeFileSync(settingsPath, JSON.stringify(data, null, 2), 'utf8');
+  writeJsonAtomicSync(settingsPath, data, 2);
 }
 
 export const settingsStore = {
@@ -55,6 +68,9 @@ export const settingsStore = {
   replace(raw: Partial<AppSettings>): AppSettings {
     settingsData = mergeSettings(raw);
     persistSettings(settingsData);
+    loadStatus = 'loaded';
+    loadFailure = undefined;
+    shadowSettingsReplace(settingsData);
     return settingsData;
   },
 
@@ -67,10 +83,15 @@ export const settingsStore = {
       },
     });
     persistSettings(settingsData);
+    shadowSettingsReplace(settingsData);
     return settingsData;
   },
 
   toggleTelegramUi(key: keyof TelegramUiSettings): AppSettings {
     return this.updateTelegramUi({ [key]: !settingsData.telegramUi[key] });
+  },
+
+  loadState(): { status: LoadStatus; error?: Error } {
+    return { status: loadStatus, ...(loadFailure ? { error: loadFailure } : {}) };
   },
 };

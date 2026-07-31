@@ -1,10 +1,18 @@
-import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type { Context } from 'telegraf';
 import type { TgHandlerContext } from '../types.js';
 import { config, isOwner } from '../../config.js';
-import { settingsStore, store, type AppSettings, type TopicEntry } from '../../store/index.js';
+import {
+  flushMsgStore,
+  msgStore,
+  settingsStore,
+  store,
+  type AppSettings,
+  type TopicEntry,
+} from '../../store/index.js';
+import { writeJsonAtomicSync } from '../../infrastructure/files/atomic-file.js';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const MSG_MAP_PATH = path.resolve(config.dataDir, 'msg-map.json');
@@ -63,6 +71,7 @@ function createMapBackup(): BridgeBackupV1 {
 }
 
 function createStateBackup(): BridgeBackupV2 {
+  flushMsgStore();
   const msgMap = readFileEntry('msg-map', MSG_MAP_PATH);
   return {
     version: 2,
@@ -76,6 +85,7 @@ function createStateBackup(): BridgeBackupV2 {
 }
 
 function createFullBackup(): BridgeBackupV2 {
+  flushMsgStore();
   const files = [
     readFileEntry('msg-map', MSG_MAP_PATH),
     readFileEntry('zalo-credentials', config.zalo.credentialsPath),
@@ -182,25 +192,38 @@ async function sendBackupDocument(
 ): Promise<void> {
   const kind = backup.version === 1 ? 1 : backup.kind;
   const filePath = backupFilePath(kind);
-  writeFileSync(filePath, JSON.stringify(backup, null, 2), 'utf8');
-
-  await ctx.telegram.sendDocument(
-    config.telegram.groupId,
-    { source: createReadStream(filePath), filename: path.basename(filePath) },
-    {
-      ...(threadId ? { message_thread_id: threadId } : {}),
-      caption,
-    },
-  );
+  writeJsonAtomicSync(filePath, backup, 2);
+  try {
+    await ctx.telegram.sendDocument(
+      config.telegram.groupId,
+      { source: createReadStream(filePath), filename: path.basename(filePath) },
+      {
+        ...(threadId ? { message_thread_id: threadId } : {}),
+        caption,
+      },
+    );
+  } finally {
+    try { unlinkSync(filePath); } catch { /* best effort */ }
+  }
 }
 
 export function registerBackupCommands({ bot }: TgHandlerContext): void {
   bot.command('backup', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;
+    if (!isOwner(ctx.from?.id)) return;
     const threadId = 'message_thread_id' in ctx.message
       ? (ctx.message.message_thread_id as number | undefined)
       : undefined;
     const kind = parseBackupKind(ctx.message.text);
+
+    if (kind === 'full' && !config.runtime.allowSecretBackup) {
+      await ctx.telegram.sendMessage(
+        config.telegram.groupId,
+        'Backup full qua Telegram đang bị tắt vì chứa token/credentials. Hãy backup Docker volume cục bộ.',
+        threadId ? { message_thread_id: threadId } : {},
+      );
+      return;
+    }
 
     if (kind === 'full' && !canExportSecrets(ctx.from?.id)) {
       await ctx.telegram.sendMessage(
@@ -244,6 +267,7 @@ export function registerBackupCommands({ bot }: TgHandlerContext): void {
 
   bot.command('restore', async (ctx) => {
     if (ctx.chat.id !== config.telegram.groupId) return;
+    if (!isOwner(ctx.from?.id)) return;
     const threadId = 'message_thread_id' in ctx.message
       ? (ctx.message.message_thread_id as number | undefined)
       : undefined;
@@ -253,8 +277,7 @@ export function registerBackupCommands({ bot }: TgHandlerContext): void {
       const restoredCount = store.replaceAll(backup.topics);
       settingsStore.replace(backup.settings);
       if (backup.msgMapContent !== undefined) {
-        mkdirSync(path.dirname(MSG_MAP_PATH), { recursive: true });
-        writeFileSync(MSG_MAP_PATH, backup.msgMapContent, 'utf8');
+        msgStore.replaceFromJson(backup.msgMapContent);
       }
 
       await ctx.telegram.sendMessage(

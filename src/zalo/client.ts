@@ -1,12 +1,14 @@
 import { Zalo, LoginQRCallbackEventType } from 'zca-js';
 import type { LoginQRCallback } from 'zca-js';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, statSync } from 'fs';
 import os from 'os';
 import path from 'path';
 import { imageSizeFromFile } from 'image-size/fromFile';
 import qrcode from 'qrcode-terminal';
 import { config } from '../config.js';
 import type { ZaloAPI } from './types.js';
+import { writeJsonAtomicSync } from '../infrastructure/files/atomic-file.js';
+import { clearZaloPolicyCaches } from './conversation-policy.js';
 
 // Use os.tmpdir() so it works on Windows (e.g. C:\Users\...\AppData\Local\Temp)
 // as well as macOS/Linux (/tmp or /var/folders/...).
@@ -53,10 +55,10 @@ export interface QRLoginHooks {
 
 function saveCredentials(data: { cookie: unknown; imei: string; userAgent: string }): void {
   try {
-    writeFileSync(
+    writeJsonAtomicSync(
       config.zalo.credentialsPath,
-      JSON.stringify({ imei: data.imei, cookie: data.cookie, userAgent: data.userAgent }, null, 2),
-      'utf8',
+      { imei: data.imei, cookie: data.cookie, userAgent: data.userAgent },
+      2,
     );
     console.log(`[Zalo] Credentials saved → ${config.zalo.credentialsPath}`);
   } catch (err) {
@@ -178,6 +180,7 @@ export async function getZaloApi(): Promise<ZaloAPI> {
 export function resetZaloApi(): void {
   _api = null;
   _apiPromise = null;
+  clearZaloPolicyCaches();
 }
 
 /**

@@ -1,0 +1,14 @@
+services:
+  bridge:
+    # The seed tool does not import application config and must not inherit
+    # Telegram/Zalo runtime secrets from the production env file.
+    env_file: !reset []
+    network_mode: none
+    environment:
+      SEED_DATA_DIR: /seed/repository/data
+      SEED_CREDENTIALS_PATH: /seed/repository/credentials.json
+    volumes:
+      - type: bind
+        source: .
+        target: /seed/repository
+        read_only: true

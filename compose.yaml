@@ -1,0 +1,58 @@
+name: zalo-tg
+
+services:
+  bridge:
+    image: ${BRIDGE_IMAGE:-zalo-tg-bridge:local}
+    build:
+      context: .
+      target: runtime
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-local-dirty}
+        BUILD_VERSION: ${BUILD_VERSION:-1.0.0}
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 180s
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      DATA_DIR: /app/data
+      HEALTH_DIR: /tmp/health
+      ZALO_CREDENTIALS_PATH: /app/data/credentials.json
+      TMPDIR: /tmp
+      PUPPETEER_TMP_DIR: /tmp
+      PUPPETEER_EXECUTABLE_PATH: /usr/bin/chromium
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+      FFMPEG_BIN: /usr/bin/ffmpeg
+      UPDATE_CHECK_ENABLED: "false"
+      TZ: Asia/Bangkok
+    volumes:
+      - bridge-data:/app/data
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1073741824,mode=1777
+    shm_size: 256m
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD", "node", "dist/runtime/healthcheck.js"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+volumes:
+  bridge-data:
+    name: ${BRIDGE_DATA_VOLUME:-zalo-tg-data}
+    external: true

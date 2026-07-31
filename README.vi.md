@@ -1,249 +1,348 @@
+<a href="README.md"><img src="https://flagcdn.com/20x15/us.png" alt="English" width="20" height="15"> English</a> · <a href="README.vi.md"><img src="https://flagcdn.com/20x15/vn.png" alt="Tiếng Việt" width="20" height="15"> Tiếng Việt</a>
+
+<hr>
+
 # zalo-tg
 
-*English version: [README.md](README.md)*
+Bridge hai chiều giữa Zalo và Telegram. Mỗi cuộc trò chuyện trực tiếp hoặc nhóm Zalo được map vào một Forum Topic trong Telegram supergroup; message, media, reply, reaction, recall, poll và một số group event được đồng bộ theo hai chiều.
 
-## Video hướng dẫn cài đặt
+Bridge chạy như một process Node.js lâu dài. SQLite và Docker named volume lưu state, media, mapping và delivery đang chờ qua các lần restart, nâng cấp và restore có kiểm soát.
 
-<video src="REC-20260510162634.mp4" controls width="100%"></video>
+## Tính năng chính
 
----
-
-Cầu nối tin nhắn hai chiều giữa **Zalo** và **Telegram**, triển khai bằng TypeScript trên Node.js. Mỗi cuộc trò chuyện Zalo (nhắn riêng hoặc nhóm) được ánh xạ tới một Forum Topic riêng biệt trong supergroup Telegram, cung cấp đồng bộ tin nhắn đầy đủ trên cả hai nền tảng.
-
----
+- Relay text và media hai chiều, tự động map conversation vào Forum Topic.
+- Đồng bộ reply, mention, reaction, recall, contact, location, poll và một số group event.
+- SQLite inbox và delivery queue bền vững, giữ FIFO theo conversation.
+- At-least-once delivery, retry, lease, provider receipt và kết quả `UNKNOWN` để operator xử lý.
+- Media spool bền vững, giới hạn kích thước, dọn object hết hạn và multipart Telegram upload.
+- Đăng nhập Zalo bằng QR qua Telegram.
+- Deployment preflight, SQLite instance lease, liveness và readiness check.
+- Docker runtime được harden: non-root user, read-only root filesystem, bỏ capability, giới hạn tài nguyên và external named volume.
 
 ## Mục lục
 
-- [Kiến trúc](#kiến-trúc)
-- [Tính năng](#tính-năng)
+- [Tech stack](#tech-stack)
 - [Yêu cầu](#yêu-cầu)
-- [Cài đặt](#cài-đặt)
+- [Bắt đầu](#bắt-đầu)
+- [Kiến trúc](#kiến-trúc)
 - [Cấu hình](#cấu-hình)
-- [Chạy ứng dụng](#chạy-ứng-dụng)
-- [Lệnh Bot](#lệnh-bot)
-- [Cấu trúc dự án](#cấu-trúc-dự-án)
+- [Telegram commands](#telegram-commands)
+- [Script và test](#script-và-test)
+- [Triển khai và vận hành](#triển-khai-và-vận-hành)
+- [Xử lý lỗi](#xử-lý-lỗi)
 - [Bảo mật](#bảo-mật)
+- [Cấu trúc project](#cấu-trúc-project)
+- [Đóng góp và giấy phép](#đóng-góp-và-giấy-phép)
 
----
+## Tech stack
 
-## Kiến trúc
-
-Bridge hoạt động như một tiến trình Node.js chạy liên tục, đồng thời duy trì:
-
-1. **Telegram bot** (qua [Telegraf](https://github.com/telegraf/telegraf)) kết nối Bot API bằng long polling.
-2. **Zalo client** (qua [zca-js](https://github.com/VolunteerSVD/zca-js)) kết nối WebSocket API nội bộ của Zalo.
-
-Hai phía giao tiếp qua một tập hợp các store trong bộ nhớ và trên đĩa, lưu ánh xạ hai chiều giữa Telegram message ID và Zalo message ID. Điều này cho phép các tính năng như reply chain, thu hồi tin nhắn và đồng bộ reaction.
-
-```
- Zalo WebSocket API
-        |
-   zalo/client.ts         (xác thực, quản lý phiên)
-        |
-   zalo/handler.ts        (decode sự kiện Zalo → Telegram)
-        |
-   store.ts               (msgStore, sentMsgStore, pollStore,
-        |                  mediaGroupStore, zaloAlbumStore,
-        |                  userCache, friendsCache, topicStore)
-        |
-   telegram/handler.ts    (decode cập nhật Telegram → Zalo)
-        |
-   Telegram Bot API (long polling)
-```
-
-**Topic mapping** (`data/topics.json`) được lưu xuống đĩa. Tất cả ánh xạ message ID được giữ trong bộ nhớ với cơ chế eviction kiểu LRU và sẽ mất khi restart tiến trình (graceful degradation: reply chain tới tin nhắn cũ đơn giản là bỏ qua `reply_parameters`).
-
----
-
-## Tính năng
-
-### Loại tin nhắn — Zalo sang Telegram
-
-| Loại Zalo (`msgType`) | Đầu ra Telegram |
-|---|---|
-| `webchat` (văn bản thuần) | `sendMessage` HTML; mention được bọc trong `<b>` |
-| `chat.photo` | `sendPhoto` (đơn) hoặc `sendMediaGroup` (album, buffer 600ms) |
-| `chat.video.msg` | `sendVideo` |
-| `chat.gif` | `sendAnimation` |
-| `share.file` | `sendDocument` với tên file gốc |
-| `chat.voice` | `sendVoice` |
-| `chat.sticker` | `sendSticker` (WebP); fallback `sendPhoto` nếu quá lớn |
-| `chat.doodle` | `sendPhoto` |
-| `chat.recommended` (link) | `sendMessage` kèm link preview |
-| `chat.location.new` | `sendLocation` (bản đồ native) |
-| `chat.webcontent` — thẻ ngân hàng | `sendPhoto` với ảnh VietQR + thông tin tài khoản |
-| `chat.webcontent` — generic | `sendMessage` với icon và nhãn |
-| Danh thiếp (contactUid) | `sendPhoto` với QR + tên/ID, hoặc `sendMessage` nếu không có QR |
-| `group.poll` — tạo | `sendPoll` + score message có nút khoá |
-| `group.poll` — cập nhật vote | Chỉnh sửa score message với số phiếu và biểu đồ thanh |
-
-### Loại tin nhắn — Telegram sang Zalo
-
-| Nội dung Telegram | Lệnh Zalo API |
-|---|---|
-| Văn bản | `sendMessage` |
-| Ảnh đơn | `sendMessage` với attachment |
-| Album ảnh (media group) | `sendMessage` với nhiều attachment (buffer 500ms) |
-| Video đơn | `sendMessage` với attachment |
-| Album video (media group) | `sendMessage` với nhiều attachment (buffer 500ms) |
-| Animation / GIF | `sendMessage` với attachment |
-| Document | `sendMessage` với attachment |
-| Voice note (OGG Opus) | Convert sang M4A qua ffmpeg → `uploadAttachment` → `sendVoice` |
-| Sticker tĩnh (WebP) | `sendMessage` với attachment |
-| Sticker động / video | Tải thumbnail JPEG → `sendMessage` với attachment |
-| Vị trí | `sendLink` với Google Maps URL; fallback `sendMessage` |
-| Danh thiếp | `sendMessage` với tên và số điện thoại |
-| Poll | `createPoll` trên Zalo + poll clone non-anonymous trên Telegram |
-
-### Đồng bộ tương tác
-
-**Reply chain** — Khi Telegram message có `reply_to_message`, bridge resolve target thành Zalo `quote` object và truyền vào `sendMessage`. Reply vào tin nhắn gốc từ Telegram sang Zalo được resolve qua reverse index trong `sentMsgStore`.
-
-**Reactions** — Cập nhật `message_reaction` của Telegram được ánh xạ qua bảng emoji tĩnh và forward qua `addReaction`. React Zalo được forward dưới dạng reply ngắn trên Telegram.
-
-**Thu hồi tin nhắn** — Sự kiện `undo` của Zalo kích hoạt `deleteMessage` trên Telegram. Lệnh `/recall` kích hoạt `api.undo` cho tin nhắn do bot gửi.
-
-**Mention** — Span `@mention` Zalo được bọc trong `<b>` trên Telegram. Entity `@username` và pattern `@Tên` văn bản thuần trên Telegram được resolve thành Zalo UID qua `userCache`. Caption ảnh/video cũng được xử lý mention.
-
-### Đồng bộ Poll
-
-- Tạo poll Zalo → Poll native Telegram + score message có nút khoá inline.
-- Tạo poll Telegram → `createPoll` Zalo + poll clone non-anonymous (cần thiết cho `poll_answer`) + score message.
-- Sự kiện `poll_answer` (Telegram) → `votePoll` Zalo + refresh score ngay qua `getPollDetail`.
-- Vote Zalo kích hoạt `group_event` với `boardType=3` → `getPollDetail` → chỉnh sửa score message.
-- Nút khoá / `stopPoll` → `lockPoll` Zalo, `stopPoll` cả 2 poll TG, score message hiển thị trạng thái đã đóng.
-
-### Quản lý nhóm
-
-- Nhóm Zalo mới → Forum Topic được tạo tự động khi nhận tin đầu tiên, avatar nhóm được fetch và pin làm tin nhắn đầu tiên.
-- Sự kiện nhóm (vào, rời, xoá, chặn) được forward dưới dạng tin hệ thống in nghiêng trong topic.
-
----
+| Thành phần | Công nghệ |
+| --- | --- |
+| Ngôn ngữ | TypeScript, ES2022, strict mode |
+| Runtime | Node.js 24 trong production image; Node.js 18+ khi local |
+| Telegram | Telegraf và Bot API long polling |
+| Zalo | `zca-js` |
+| Persistence | SQLite qua `better-sqlite3`, WAL mode, migration có version |
+| Media | FFmpeg, Chromium/Puppeteer, `image-size`, durable media spool |
+| Build | TypeScript compiler và `tsx` |
+| Deployment | Docker Compose; có kèm systemd unit cũ |
 
 ## Yêu cầu
 
-| Phụ thuộc | Phiên bản | Ghi chú |
-|---|---|---|
-| Node.js | >= 18 | Cần hỗ trợ ESM |
-| npm | >= 9 | |
-| ffmpeg | bất kỳ | Phải có trong `PATH`; dùng convert OGG→M4A |
-| Telegram Bot | — | Tạo qua [@BotFather](https://t.me/BotFather) |
-| Telegram Supergroup | — | Bật chế độ Topics; bot phải là admin |
-| Tài khoản Zalo | — | Đang hoạt động; session lưu trong `credentials.json` |
+- Node.js 18+ và npm 9+ để chạy local.
+- FFmpeg trong `PATH` để convert voice và xử lý media. Production image đã có sẵn.
+- Telegram bot tạo bằng [@BotFather](https://t.me/BotFather).
+- Telegram supergroup private đã bật Forum Topics. Bot cần quyền **Manage Topics**, **Delete Messages**, **Pin Messages** và reaction access.
+- Zalo account đang hoạt động. Session nằm trong `credentials.json` hoặc credentials path đã cấu hình.
+- Docker Engine và Docker Compose v2 cho production deployment được khuyến nghị.
 
-**Quyền admin bot cần có trong supergroup Telegram:**
-- Quản lý topic (tạo, sửa)
-- Xoá tin nhắn
-- Pin tin nhắn
-- Quản lý nhóm (để nhận cập nhật `message_reaction`)
+## Bắt đầu
 
----
+### 1. Cài dependency
 
-## Cài đặt
+~~~bash
+git clone <repository-url>
+cd zalo-tg-refactor
+npm ci
+~~~
 
-```bash
-git clone https://github.com/williamcachamwri/zalo-tg
-cd zalo-tg
-npm install
-cp .env.example .env
-```
+`npm ci` dùng lockfile và cài native dependency cho `better-sqlite3`.
 
----
+### 2. Cấu hình bridge
+
+~~~powershell
+Copy-Item .env.example .env
+~~~
+
+Đặt tối thiểu các giá trị sau trong `.env`:
+
+~~~dotenv
+TG_TOKEN=replace-with-telegram-bot-token
+TG_GROUP_ID=-1001234567890
+TG_OWNER_IDS=123456789,987654321
+~~~
+
+`TG_GROUP_ID` phải là supergroup ID âm. Mỗi giá trị trong `TG_OWNER_IDS` phải là Telegram user ID dương. Không commit `.env`, `credentials.json`, SQLite file hoặc backup.
+
+### 3. Chạy local
+
+~~~bash
+npm run dev
+~~~
+
+Command này chạy `src/index.ts` bằng `tsx watch`. Lần đầu sử dụng, gửi `/login` trong Telegram group đã cấu hình và quét QR bằng ứng dụng Zalo mobile.
+
+~~~bash
+npm run build
+npm start
+~~~
+
+Chuỗi lệnh trên compile vào `dist/` rồi chạy production entrypoint.
+
+### 4. Chạy Docker Compose
+
+~~~powershell
+docker volume create zalo-tg-data
+docker compose config --quiet
+docker compose build --pull bridge
+docker compose up -d --no-build bridge
+docker compose ps
+docker compose logs --tail=200 bridge
+~~~
+
+Service không publish host port vì dùng Telegram long polling. Data được mount tại `/app/data` từ external volume `zalo-tg-data`. Để import data repository vào volume mới đúng một lần:
+
+~~~powershell
+npm run docker:seed
+~~~
+
+### 5. Xác minh deployment
+
+~~~powershell
+docker compose exec -T bridge node dist/runtime/healthcheck.js
+docker compose exec -T bridge node dist/runtime/healthcheck.js --readiness
+~~~
+
+Output cần có là `alive` rồi `ready`. Trước khi chấp nhận deployment, hãy gửi một test message thật theo mỗi chiều.
+
+## Kiến trúc
+
+### Luồng runtime
+
+~~~text
+Telegram update (long polling) ─┐
+                                ├─ handler ─ durable SQLite inbox/queue ─ provider API
+Zalo listener event ────────────┘                                  │
+                                                                   └─ message/topic mapping
+~~~
+
+Startup validate config, mở SQLite, chạy migration có checksum, import legacy JSON nếu cần, hydrate compatibility store, recover media download dở, lấy single-instance lease và khởi động durable worker. Telegram permission được kiểm tra trước relay Zalo. Nếu Zalo chưa authenticated, Telegram vẫn hoạt động để operator dùng `/login`.
+
+### Durability và recovery
+
+- SQLite là recovery source cho topic/message link, alias, setting, delivery attempt, receipt, media object và operator action.
+- Delivery state là `READY`, `SENDING`, `RETRY`, `SENT`, `SKIPPED`, `UNKNOWN` và `PERMANENT_FAILED`.
+- Bridge có ngữ nghĩa **at least once**, không phải exactly once. Request có thể đã đến provider trước khi crash sẽ thành `UNKNOWN`, thay vì được replay mù.
+- FIFO được giữ theo từng conversation. Dùng `/queue` để kiểm tra delivery đang queue, retry hoặc chưa chắc chắn.
+- `topics.json`, `settings.json` và `msg-map.json` legacy được import, sau đó có thể hydrate atomically từ SQLite.
+
+### Persistent layout
+
+~~~text
+/app/data/
+├── bridge.db                 # SQLite database; WAL có thể tạo -wal và -shm
+├── credentials.json          # Zalo session secret
+├── topics.json               # legacy compatibility state
+├── settings.json             # legacy compatibility state
+├── msg-map.json              # legacy compatibility state
+├── media/                    # durable media object
+└── backups/                  # application backup artifact nếu bật
+~~~
+
+Health heartbeat nằm tại `/tmp/health/health.json` trong production. Readiness yêu cầu `storage`, `telegram` và `zalo` đều `ready`; Compose healthcheck chỉ test liveness.
 
 ## Cấu hình
 
-Chỉnh sửa `.env`:
+Copy `.env.example` thành `.env`. ID, boolean, số hoặc production path không hợp lệ sẽ fail fast khi startup.
 
-```env
-# Token Telegram Bot từ @BotFather
-TG_TOKEN=123456789:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+### Bắt buộc
 
-# ID supergroup Telegram (số nguyên âm, ví dụ: -1001234567890)
-TG_GROUP_ID=-1001234567890
+| Variable | Mô tả | Ví dụ |
+| --- | --- | --- |
+| `TG_TOKEN` | BotFather token | `123456:replace-me` |
+| `TG_GROUP_ID` | Supergroup ID đích; số âm | `-1001234567890` |
+| `TG_OWNER_IDS` | User ID có quyền cao, phân tách bằng dấu phẩy/khoảng trắng | `123456789,987654321` |
 
-# Thư mục lưu dữ liệu (topics.json, credentials.json)
-# Mặc định ./data nếu bỏ trống
-DATA_DIR=./data
+### Runtime và storage
 
-# Bỏ qua forward tin nhắn từ các nhóm Zalo đã tắt thông báo
-# Mặc định false; đặt true/1/yes/on để bật
-ZALO_SKIP_MUTED_GROUPS=false
-```
+| Variable | Mặc định | Mục đích |
+| --- | --- | --- |
+| `DATA_DIR` | `./data` local; `/app/data` trong Docker | Root cho application state |
+| `DATABASE_PATH` | `<DATA_DIR>/bridge.db` | SQLite database; production phải nằm trong `DATA_DIR` |
+| `ZALO_CREDENTIALS_PATH` | `credentials.json` local; `/app/data/credentials.json` Docker | Zalo session; production phải nằm trong `DATA_DIR` |
+| `HEALTH_DIR` | `DATA_DIR` | Thư mục chứa `health.json` |
+| `BRIDGE_DATA_VOLUME` | `zalo-tg-data` | External Docker volume |
+| `BRIDGE_IMAGE` | `zalo-tg-bridge:local` | Docker image reference |
+| `BUILD_REVISION` | `local-dirty` | OCI revision label |
+| `BUILD_VERSION` | `1.0.0` | OCI version label |
 
----
+### Limit và feature flag
 
-## Chạy ứng dụng
+| Variable | Mặc định | Giới hạn hoặc tác dụng |
+| --- | ---: | --- |
+| `TG_DOWNLOAD_MAX_MB` | 20 | Tối đa 200 MB |
+| `TG_UPLOAD_PART_MB` | 45 | Tối đa 200 MB |
+| `TG_UPLOAD_TIMEOUT_SEC` | 600 | Tối đa 3600 giây |
+| `MEDIA_MAX_OBJECT_MB` | 200 | Tối đa 2048 MB |
+| `MEDIA_SPOOL_MAX_MB` | 5120 | Tối đa 102400 MB |
+| `DELIVERY_SENT_RETENTION_DAYS` | 90 | Tối đa 3650 ngày |
+| `DATA_MIN_FREE_MB` | 512 | Ngưỡng dung lượng trống |
+| `ZALO_SKIP_MUTED_GROUPS` | false | Bỏ qua message từ muted group |
+| `ZALO_SKIP_STRANGER_MESSAGES` | false | Bỏ qua DM từ người không phải friend |
+| `UPDATE_CHECK_ENABLED` | false trong production | Bật update notification |
+| `ALLOW_SECRET_BACKUP` | false | Cho phép backup chứa secret |
+| `TG_API_ROOT` | unset | Bot API root tùy chọn; đọc `docs/operations.md` trước |
 
-```bash
-# Development — hot reload qua tsx watch
-npm run dev
+Boolean nhận `1/true/yes/on` và `0/false/no/off`.
 
-# Production
+## Telegram commands
+
+| Command | Mục đích |
+| --- | --- |
+| `/login` | Đăng nhập Zalo bằng QR |
+| `/status` | Xem bridge và provider status |
+| `/topic list\|info\|delete` | Xem hoặc bỏ topic mapping |
+| `/search <query>` | Tìm friend và tạo direct-message topic |
+| `/addfriend`, `/friendrequests` | Quản lý friend request Zalo |
+| `/addgroup`, `/joingroup`, `/leavegroup` | Quản lý nhóm Zalo |
+| `/recall` | Recall message Zalo do bot gửi |
+| `/queue` | Xem queue, retry và delivery `UNKNOWN` |
+| `/backup`, `/restore` | Backup/restore application có kiểm soát |
+| `/settings`, `/members`, `/kick`, `/clear` | Thao tác quản trị |
+| `/help`, `/menu` | Xem command catalog hiện tại |
+
+Hành động có quyền cao bị giới hạn bởi `TG_OWNER_IDS`. Giữ group private vì member thường vẫn relay được message.
+
+## Script và test
+
+| Command | Mô tả |
+| --- | --- |
+| `npm run dev` | Chạy TypeScript với hot reload |
+| `npm run build` | Compile `src/` vào `dist/` |
+| `npm start` | Chạy bridge đã compile |
+| `npm test` | Chạy TypeScript test qua Node |
+| `npm run healthcheck` | Chạy compiled liveness check |
+| `npm run docker:seed` | Seed Docker volume từ data repository |
+| `npm run tgs:gif` | Convert TGS sticker input thành GIF |
+
+Trước deployment:
+
+~~~powershell
+npm ci
 npm run build
-npm start
-```
+npm test
+npm audit --audit-level=high
+npm audit --omit=dev --audit-level=high
+git diff --check
+~~~
 
-Lần đầu chưa có `credentials.json`, gửi `/login` trong bất kỳ topic nào của group Telegram đã bridge. Bot sẽ gửi ảnh QR Zalo; quét bằng app Zalo tại **Cài đặt → Đăng nhập bằng QR**.
+Test bao phủ config, migration/recovery, legacy import, durable relay, media spool, authorization, command registration, health và provider policy.
 
----
+## Triển khai và vận hành
 
-## Lệnh Bot
+Docker Compose là deployment path được duy trì. Production container chạy UID/GID 10001, read-only root filesystem, không có Linux capability, có `no-new-privileges`, `/tmp` giới hạn, RAM 2 GiB và 2 CPU.
 
-| Lệnh | Mô tả |
-|---|---|
-| `/login` | Bắt đầu xác thực Zalo bằng QR code |
-| `/search <truy vấn>` | Tìm kiếm danh sách bạn bè Zalo; chọn kết quả để tạo topic DM |
-| `/recall` | Thu hồi tin nhắn đã gửi từ Telegram sang Zalo (reply vào tin cần thu hồi) |
-| `/topic list` | Liệt kê tất cả ánh xạ topic–cuộc trò chuyện đang hoạt động |
-| `/topic info` | Hiển thị thông tin cuộc trò chuyện Zalo của topic hiện tại |
-| `/topic delete` | Xoá ánh xạ của topic hiện tại |
+~~~powershell
+docker compose build --pull --build-arg BUILD_REVISION=$(git rev-parse HEAD) --build-arg BUILD_VERSION=1.0.0 bridge
+docker compose up -d --no-build bridge
+~~~
 
----
+Không chạy hai instance cùng một volume. SQLite lease là safety net, không phải cơ chế multi-instance được hỗ trợ.
 
-## Cấu trúc dự án
+Development Compose:
 
-```
-src/
-├── index.ts                  Entry point. Khởi tạo Telegraf, Zalo client,
-│                             gắn cả 2 handler, bắt đầu polling.
-├── config.ts                 Đọc và kiểm tra biến môi trường.
-├── store.ts                  Toàn bộ state trong bộ nhớ và trên đĩa:
-│                               - topicStore      (lưu đĩa, topics.json)
-│                               - msgStore        (Zalo msgId ↔ TG message_id)
-│                               - sentMsgStore    (reverse index TG→Zalo msgId)
-│                               - pollStore       (ánh xạ poll ↔ TG poll message)
-│                               - mediaGroupStore (buffer media group TG)
-│                               - zaloAlbumStore  (buffer album Zalo)
-│                               - userCache       (uid ↔ displayName)
-│                               - friendsCache    (danh sách bạn, TTL 5 phút)
-├── telegram/
-│   ├── bot.ts                Instance Telegraf; thiết lập allowedUpdates.
-│   └── handler.ts            Xử lý tất cả cập nhật Telegram và forward sang Zalo.
-│                             Xử lý: text, media, voice, sticker, poll, location,
-│                             contact, reaction, callback_query, poll_answer.
-├── zalo/
-│   ├── client.ts             Khởi tạo Zalo API và QR login flow.
-│   ├── types.ts              Interface TypeScript và hằng số ZALO_MSG_TYPES.
-│   └── handler.ts            Xử lý tất cả sự kiện Zalo listener và forward sang TG.
-│                             Xử lý: message (tất cả msgType), undo, reaction,
-│                             group_event (join/leave/poll/update_board).
-└── utils/
-    ├── format.ts             Escape HTML, áp dụng mention, helper caption.
-    └── media.ts              Download file tạm, dọn dẹp, convert OGG→M4A.
-```
+~~~powershell
+docker compose -f compose.yaml -f compose.dev.yaml up --build bridge
+~~~
 
----
+Profile này mount `src/` read-only, chạy `npm run dev` và lưu development state trong `zalo-tg-dev-data`.
+
+Đọc [docs/operations.md](docs/operations.md) trước khi làm production. Tài liệu mô tả rotate token, deployment đầu tiên, seed/import, queue handling, backup, restore, rollback và acceptance check.
+
+~~~powershell
+./scripts/backup-docker-volume.ps1 -DryRun
+./scripts/backup-docker-volume.ps1
+./scripts/restore-docker-volume.ps1 -ArchivePath .\backups\zalo-tg-data-YYYYMMDD-HHMMSS.tgz -DryRun
+~~~
+
+Backup chứa credentials, verify SQLite integrity và tạo SHA-256 cùng manifest. Restore luôn target volume mới, verify archive/database và không tự sửa `.env` hoặc Compose cutover.
+
+## Xử lý lỗi
+
+### Startup dừng
+
+~~~powershell
+docker compose logs --tail=200 bridge
+~~~
+
+Kiểm tra Telegram variable thiếu, group/owner ID sai, production database hoặc credentials path nằm ngoài `DATA_DIR`, thiếu Telegram administrator permission hoặc instance khác đang dùng volume đó.
+
+### Liveness pass nhưng readiness fail
+
+~~~powershell
+docker compose exec -T bridge node dist/runtime/healthcheck.js --readiness
+~~~
+
+Mọi component phải ready. `zalo=degraded` thường là Zalo reconnect hoặc cần `/login`. Compose không restart process còn chạy nhưng unhealthy; dùng supervisor bên ngoài nếu cần self-healing ở host.
+
+### Delivery là `UNKNOWN`
+
+Dùng `/queue` và xem receipt/attempt trước retry. Replay mù có thể duplicate vì provider có thể đã nhận request.
+
+### Media conversion lỗi
+
+Kiểm tra FFmpeg, Chromium, `MEDIA_MAX_OBJECT_MB`, `MEDIA_SPOOL_MAX_MB` và dung lượng trống theo `DATA_MIN_FREE_MB`.
+
+### State dường như bị mất
+
+Xác nhận named volume đúng đang mount. Không xóa volume để cleanup; restore vào volume mới, verify rồi mới cutover có chủ đích.
 
 ## Bảo mật
 
-- `.env` và `credentials.json` được liệt kê trong `.gitignore` và tuyệt đối không được commit lên version control.
-- `credentials.json` chứa session token Zalo tương đương với mật khẩu tài khoản. Cần bảo vệ với mức độ bảo mật tương đương.
-- Bridge vận hành theo mô hình single-user: group Telegram phải là riêng tư và chỉ giới hạn cho thành viên tin cậy, vì bất kỳ thành viên nào cũng có thể gửi tin nhắn qua bridge.
-- Tất cả request HTTP tới Telegram và Zalo đều dùng TLS. Không có credential nào được ghi vào log.
-- Lệnh `/recall` không bị hạn chế trong group — bất kỳ thành viên nào cũng có thể thu hồi tin nhắn do bot gửi. Hãy hạn chế quyền admin bot hoặc tư cách thành viên group nếu đây là mối lo ngại.
+- Rotate Telegram token ngay nếu token xuất hiện trong log, diagnostic, screenshot hoặc chat.
+- Không commit hoặc chia sẻ `.env`, `credentials.json`, SQLite file hay backup archive.
+- Dùng Telegram group private với member tin cậy.
+- Giữ `ALLOW_SECRET_BACKUP=false` trừ khi quy trình access-controlled yêu cầu.
+- Xem `credentials.json` như password của Zalo account.
+- Không expose public container port; bridge dùng long polling.
 
----
+## Cấu trúc project
 
-## License
+~~~text
+src/
+├── index.ts                         bootstrap, lifecycle, reconnect, shutdown
+├── config.ts                        parse và validate environment
+├── application/                     durable relay Telegram/Zalo và media workflow
+├── bootstrap/                       environment và compatibility-store hydration
+├── domain/                          ID, link, retry, provider/topic error
+├── infrastructure/database/         SQLite, migration, repository, shadow state
+├── infrastructure/files/            atomic file operation
+├── infrastructure/media/            durable media spool
+├── runtime/                         health, healthcheck, redaction, instance lease
+├── store/                           compatibility topic/message/user/poll/settings store
+├── telegram/                        bot, authorization, handler, command, UI
+├── zalo/                            client, listener, handler, policy
+├── tools/                           Docker seed/verify và TGS conversion
+└── utils/                           format, download, media, Telegram queue
+tests/                               TypeScript test chạy bằng Node
+compose*.yaml                        production, development và seed overlay
+Dockerfile                           multi-stage production image
+docs/operations.md                   production runbook
+scripts/                             PowerShell backup và restore
+~~~
 
-MIT
+## Đóng góp và giấy phép
+
+Trước pull request, chạy `npm run build`, `npm test`, Docker validation liên quan và `git diff --check`. Giữ behavior, vận hành documentation và test đồng bộ; không thêm secret hoặc generated data.
+
+Repository chưa có file license. Reuse và redistribution cần project owner phê duyệt cho đến khi có license.

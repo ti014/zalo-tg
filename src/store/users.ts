@@ -66,6 +66,11 @@ let _friends:    ZaloFriend[] = [];
 let _friendsTs:  number       = 0;
 
 export const friendsCache = {
+  clear(): void {
+    _friends = [];
+    _friendsTs = 0;
+  },
+
   set(list: ZaloFriend[]): void {
     _friends   = list;
     _friendsTs = Date.now();
@@ -83,7 +88,11 @@ export const friendsCache = {
   },
 
   isFresh(): boolean {
-    return _friends.length > 0 && Date.now() - _friendsTs < FRIENDS_TTL_MS;
+    return _friendsTs > 0 && Date.now() - _friendsTs < FRIENDS_TTL_MS;
+  },
+
+  has(userId: string): boolean {
+    return _friends.some(friend => friend.userId === userId);
   },
 };
 

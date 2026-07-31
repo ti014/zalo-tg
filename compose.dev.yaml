@@ -1,0 +1,23 @@
+services:
+  bridge:
+    build:
+      target: development
+    image: zalo-tg-bridge:dev
+    command: npm run dev
+    restart: "no"
+    read_only: false
+    environment:
+      NODE_ENV: development
+      DATA_DIR: /app/data
+      HEALTH_DIR: /tmp/health
+      PUPPETEER_TMP_DIR: /tmp
+    volumes:
+      - ./src:/app/src:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+      - bridge-dev-data:/app/data
+    healthcheck:
+      disable: true
+
+volumes:
+  bridge-dev-data:
+    name: zalo-tg-dev-data
