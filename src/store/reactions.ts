@@ -32,6 +32,10 @@ export const reactionSummaryStore = {
       .map(([emoji, names]) => `${emoji} ${names.join(', ')}`)
       .join('  ');
   },
+
+  stats(): { entries: number } {
+    return { entries: _reactionSummaries.size };
+  },
 };
 
 const REACTION_ECHO_TTL_MS = 8_000;
@@ -82,3 +86,88 @@ export const reactionEchoStore = {
     decrementPendingReactionEcho(key);
   },
 };
+
+const REACTION_EVENT_DEDUPE_TTL_MS = 15_000;
+const REACTION_EVENT_DEDUPE_MAX = 20_000;
+const _recentReactionEvents = new Map<string, number>();
+
+function pruneRecentReactionEvents(now = Date.now()): void {
+  for (const [key, timestamp] of _recentReactionEvents) {
+    if (now - timestamp > REACTION_EVENT_DEDUPE_TTL_MS) _recentReactionEvents.delete(key);
+  }
+  while (_recentReactionEvents.size > REACTION_EVENT_DEDUPE_MAX) {
+    const oldest = _recentReactionEvents.keys().next().value as string | undefined;
+    if (!oldest) break;
+    _recentReactionEvents.delete(oldest);
+  }
+}
+
+function markRecentReactionEvent(key: string): boolean {
+  const now = Date.now();
+  pruneRecentReactionEvents(now);
+  const seenAt = _recentReactionEvents.get(key);
+  if (seenAt !== undefined && now - seenAt <= REACTION_EVENT_DEDUPE_TTL_MS) return true;
+  _recentReactionEvents.set(key, now);
+  return false;
+}
+
+function normalizeReactionName(input: string): string {
+  return input.trim().normalize('NFC').replace(/\s+/g, ' ').toLowerCase();
+}
+
+function normalizeReactionMsgIds(ids: string[]): string[] {
+  return Array.from(new Set(ids.map(id => id.trim()).filter(Boolean))).sort();
+}
+
+export const reactionEventDedupeStore = {
+  isDuplicateZaloInbound(input: {
+    zaloId: string;
+    targetMsgIds: string[];
+    icon: string;
+    actorUid?: string;
+    actorName?: string;
+  }): boolean {
+    const targetKey = normalizeReactionMsgIds(input.targetMsgIds).join('|');
+    if (!targetKey) return false;
+    const actorKey = input.actorUid?.trim()
+      || (input.actorName ? normalizeReactionName(input.actorName) : '')
+      || 'unknown';
+    return markRecentReactionEvent(
+      `zalo-in::${input.zaloId.trim()}::${targetKey}::${input.icon.trim()}::${actorKey}`,
+    );
+  },
+
+  isDuplicateTgOutbound(input: {
+    chatId: number;
+    messageId: number;
+    actorId: string;
+    emoji: string;
+  }): boolean {
+    return markRecentReactionEvent(
+      `tg-out::${input.chatId}::${input.messageId}::${input.actorId.trim()}::${input.emoji.trim()}`,
+    );
+  },
+
+  stats(): { entries: number } {
+    pruneRecentReactionEvents();
+    return { entries: _recentReactionEvents.size };
+  },
+};
+
+const RECALLED_TTL_MS = 5_000;
+const recentlyRecalledMsgIds = new Set<string>();
+
+export function markRecentlyRecalled(...msgIds: Array<string | number | undefined>): void {
+  for (const value of msgIds) {
+    if (value === undefined) continue;
+    const msgId = String(value).trim();
+    if (!msgId || msgId === '0') continue;
+    recentlyRecalledMsgIds.add(msgId);
+    const timer = setTimeout(() => recentlyRecalledMsgIds.delete(msgId), RECALLED_TTL_MS);
+    timer.unref?.();
+  }
+}
+
+export function wasRecentlyRecalled(msgId: string): boolean {
+  return recentlyRecalledMsgIds.has(msgId);
+}

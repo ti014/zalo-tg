@@ -1,4 +1,8 @@
-import type { SentMsgInfo, ZaloQuoteData } from '../../store/messages.js';
+import {
+  sentMessageIds,
+  type SentMsgInfo,
+  type ZaloQuoteData,
+} from '../../store/messages.js';
 import type { AppSettings } from '../../store/settings.js';
 import type { TopicEntry } from '../../store/topics.js';
 import { normalizeMessageId, normalizeMessageIds } from '../../domain/message-id.js';
@@ -56,9 +60,11 @@ function incomingAliasInputs(
 }
 
 function sentAliasInputs(info: SentMsgInfo): MessageAliasInput[] {
+  const msgIds = sentMessageIds(info);
   return [
-    { value: info.msgId, kind: 'msg_id' },
+    ...(msgIds[0] === undefined ? [] : [{ value: msgIds[0], kind: 'msg_id' as const }]),
     { value: info.cliMsgId, kind: 'cli_msg_id' },
+    ...msgIds.slice(1).map(value => ({ value, kind: 'provider_alias' as const })),
   ];
 }
 
@@ -221,15 +227,24 @@ export function lookupShadowSentInfo(telegramMessageId: number): SentMsgInfo | u
   const match = link.conversation_key.match(/^([01]):(.+)$/);
   if (!match) return undefined;
   const aliases = shadowDb.prepare(`
-    SELECT alias
+    SELECT alias, alias_kind
     FROM message_aliases
     WHERE message_link_id = ?
     ORDER BY CASE alias_kind WHEN 'msg_id' THEN 0 WHEN 'cli_msg_id' THEN 1 ELSE 2 END, rowid
-  `).all(link.id) as Array<{ alias: string }>;
-  if (!aliases[0]) return undefined;
+  `).all(link.id) as Array<{ alias: string; alias_kind: MessageAliasKind }>;
+  const primary = aliases.find(alias => alias.alias_kind === 'msg_id') ?? aliases[0];
+  if (!primary) return undefined;
+  const cli = aliases.find(alias => alias.alias_kind === 'cli_msg_id');
+  const msgIds = [
+    primary.alias,
+    ...aliases
+      .filter(alias => alias.alias_kind === 'provider_alias')
+      .map(alias => alias.alias),
+  ];
   return {
-    msgId: aliases[0].alias,
-    ...(aliases[1] ? { cliMsgId: aliases[1].alias } : {}),
+    msgId: primary.alias,
+    ...(cli ? { cliMsgId: cli.alias } : {}),
+    ...(msgIds.length > 1 ? { msgIds } : {}),
     zaloId: match[2]!,
     threadType: Number(match[1]) as 0 | 1,
   };

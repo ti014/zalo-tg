@@ -26,6 +26,7 @@ services:
       PUPPETEER_SKIP_DOWNLOAD: "true"
       FFMPEG_BIN: /usr/bin/ffmpeg
       UPDATE_CHECK_ENABLED: "false"
+      RESTART_ON_COMMAND: "true"
       TZ: Asia/Bangkok
     volumes:
       - bridge-data:/app/data

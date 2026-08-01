@@ -1,18 +1,68 @@
-import { FriendEventType } from 'zca-js';
+import { FriendEventType, ThreadType } from 'zca-js';
 import type { ZaloAPI } from './types.js';
-import { store, msgStore, pollStore, sentMsgStore, reactionEchoStore, reactionSummaryStore } from '../store/index.js';
+import {
+  store,
+  msgStore,
+  pollStore,
+  sentMsgStore,
+  reactionEchoStore,
+  reactionSummaryStore,
+  reactionEventDedupeStore,
+  wasRecentlyRecalled,
+} from '../store/index.js';
 import { config } from '../config.js';
-import { escapeHtml } from '../utils/format.js';
-import { buildScoreText, resolveUserDisplayName, tg } from './helpers.js';
+import { escapeHtml, topicName } from '../utils/format.js';
+import {
+  buildScoreText,
+  invalidateCachedGroupInfo,
+  resolveUserDisplayName,
+  tg,
+} from './helpers.js';
 import { runZaloRequest } from './rate-limit.js';
+import {
+  extractReactionTargetMsgIds,
+  ZALO_TO_TELEGRAM_REACTION,
+} from './reaction.js';
+import { extractUndoTargetId, parseGroupRename } from './system-events.js';
+
+interface GroupEventMember {
+  id?: unknown;
+  uid?: unknown;
+  userId?: unknown;
+  dName?: unknown;
+}
+
+function groupEventMemberUid(member: GroupEventMember): string {
+  return String(member.id ?? member.uid ?? member.userId ?? '').split('_')[0]?.trim() ?? '';
+}
+
+async function resolveGroupEventMemberNames(
+  api: ZaloAPI,
+  members: GroupEventMember[],
+  groupId: string,
+): Promise<string> {
+  const names = await Promise.all(members.map(member => {
+    const uid = groupEventMemberUid(member);
+    const fallback = typeof member.dName === 'string' && member.dName.trim()
+      ? member.dName.trim()
+      : uid || '?';
+    return resolveUserDisplayName(api, uid || undefined, fallback, groupId);
+  }));
+  return names.join(', ');
+}
 
 export function registerZaloEventHandlers(api: ZaloAPI): void {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   api.listener.on('undo', async (undo: any) => {
     try {
       const data = undo?.data;
-      const zaloMsgId = String(data?.content?.globalMsgId ?? data?.msgId ?? '');
+      const zaloMsgId = extractUndoTargetId(undo);
       if (!zaloMsgId) return;
+
+      if (wasRecentlyRecalled(zaloMsgId)) {
+        console.log(`[ZaloHandler] Undo: skip bridge-initiated recall msgId=${zaloMsgId}`);
+        return;
+      }
 
       const tgMsgId = msgStore.getTgMsgId(zaloMsgId);
       if (tgMsgId === undefined) {
@@ -25,14 +75,16 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
       const topicId = store.getTopicByZalo(String(zaloId), type);
       if (topicId === undefined) return;
 
-      await tg.deleteMessage(config.telegram.groupId, tgMsgId);
-      console.log(`[ZaloHandler] Undo: deleted TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
-
       await tg.sendMessage(
         config.telegram.groupId,
-        `<i>🗑 Tin nhắn đã được thu hồi</i>`,
-        { message_thread_id: topicId, parse_mode: 'HTML' },
+        '<i>🗑 Tin nhắn này đã bị thu hồi trên Zalo</i>',
+        {
+          message_thread_id: topicId,
+          parse_mode: 'HTML',
+          reply_parameters: { message_id: tgMsgId, allow_sending_without_reply: true },
+        },
       );
+      console.log(`[ZaloHandler] Undo: notified TG msg ${tgMsgId} (zaloMsgId=${zaloMsgId})`);
     } catch (err) {
       console.error('[ZaloHandler] Undo error:', err);
     }
@@ -83,21 +135,38 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
 
       if (!rIcon) return;
 
-      const gMsgIds: Array<{ gMsgID?: string | number }> = data?.content?.rMsg ?? [];
-      const zaloMsgId = String(gMsgIds[0]?.gMsgID ?? '');
-      if (!zaloMsgId) return;
+      const targetMsgIds = extractReactionTargetMsgIds(data);
+      if (targetMsgIds.length === 0) return;
 
       const zaloId = String(reaction?.threadId ?? data?.idTo ?? "");
       if (!zaloId) return;
 
-      if (reaction?.isSelf && reactionEchoStore.consume(zaloId, zaloMsgId, rIcon)) {
-        console.log("[ZaloHandler] Reaction: skip bridge echo for " + zaloId + "/" + zaloMsgId + "/" + rIcon);
+      const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
+      const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom.trim() : '';
+      if (reactionEventDedupeStore.isDuplicateZaloInbound({
+        zaloId,
+        targetMsgIds,
+        icon: rIcon,
+        ...(actorUid ? { actorUid } : {}),
+        ...(rawName ? { actorName: rawName } : {}),
+      })) {
+        console.log(`[ZaloHandler] Reaction: skip duplicate ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
         return;
       }
 
-      const tgMsgId = msgStore.getTgMsgId(zaloMsgId) ?? sentMsgStore.getByZaloMsgId(zaloMsgId);
+      if (reaction?.isSelf && targetMsgIds.some(id => reactionEchoStore.consume(zaloId, id, rIcon))) {
+        console.log(`[ZaloHandler] Reaction: skip bridge echo for ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
+        return;
+      }
+
+      let tgMsgId: number | undefined;
+      for (const targetMsgId of targetMsgIds) {
+        tgMsgId = msgStore.getTgMsgId(targetMsgId)
+          ?? sentMsgStore.getByZaloMsgId(targetMsgId);
+        if (tgMsgId !== undefined) break;
+      }
       if (tgMsgId === undefined) {
-        console.log(`[ZaloHandler] Reaction: no TG mapping for zaloMsgId=${zaloMsgId}`);
+        console.log(`[ZaloHandler] Reaction: no TG mapping for targets=${targetMsgIds.join('|')}`);
         return;
       }
 
@@ -105,9 +174,26 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
       const topicId = store.getTopicByZalo(zaloId, type);
       if (topicId === undefined) return;
 
-      const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
-      const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom : undefined;
-      const actorName = rawName || await resolveUserDisplayName(api, actorUid, 'ai đó');
+      const nativeReaction = ZALO_TO_TELEGRAM_REACTION[rIcon];
+      if (type === 0 && nativeReaction) {
+        try {
+          await tg.setMessageReaction(
+            config.telegram.groupId,
+            tgMsgId,
+            [{ type: 'emoji', emoji: nativeReaction }] as Parameters<typeof tg.setMessageReaction>[2],
+          );
+          return;
+        } catch (error) {
+          console.warn(`[ZaloHandler] Native reaction ${nativeReaction} rejected; using summary:`, error);
+        }
+      }
+
+      const actorName = await resolveUserDisplayName(
+        api,
+        actorUid || undefined,
+        rawName || 'ai đó',
+        type === 1 ? zaloId : undefined,
+      );
 
       const entry = reactionSummaryStore.upsert(tgMsgId, emoji, actorName);
 
@@ -152,6 +238,16 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
     }
   });
 
+  api.listener.on('old_reactions', (reactions: unknown[], isGroup: boolean) => {
+    if (!Array.isArray(reactions) || reactions.length === 0) return;
+    for (const item of reactions) {
+      if (!item || typeof item !== 'object') continue;
+      const reaction = item as Record<string, unknown>;
+      if (reaction.isGroup === undefined) reaction.isGroup = isGroup;
+      api.listener.emit('reaction', reaction);
+    }
+  });
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   api.listener.on('group_event', async (event: any) => {
     try {
@@ -159,6 +255,59 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
       const data    = event?.data;
       const groupId = String(event?.threadId ?? data?.groupId ?? '');
       if (!groupId) return;
+
+      if (type === 'join_request') {
+        const uids = Array.isArray(data?.uids) ? data.uids.map((uid: unknown) => String(uid)).filter(Boolean) : [];
+        if (uids.length === 0) return;
+        let adminIds: string[] = [];
+        let creatorId = '';
+        try {
+          const info = await runZaloRequest(
+            { label: `getGroupInfo(join_request:${groupId})`, priority: 'low', maxRetries: 0 },
+            () => api.getGroupInfo(groupId),
+          ) as { gridInfoMap?: Record<string, { adminIds?: string[]; creatorId?: string }> };
+          adminIds = info?.gridInfoMap?.[groupId]?.adminIds ?? [];
+          creatorId = info?.gridInfoMap?.[groupId]?.creatorId ?? '';
+        } catch { /* fall through and do not expose a possibly unauthorized action */ }
+        const ownId = String(api.getOwnId?.() ?? '');
+        if (!ownId || (!adminIds.includes(ownId) && creatorId !== ownId)) return;
+        const topicId = store.getTopicByZalo(groupId, 1);
+        if (topicId === undefined) return;
+        for (const uid of uids) {
+          const name = await resolveUserDisplayName(api, uid, uid);
+          await tg.sendMessage(
+            config.telegram.groupId,
+            `🔔 <b>${escapeHtml(name)}</b> (<code>${escapeHtml(uid)}</code>) muốn tham gia nhóm.`,
+            {
+              message_thread_id: topicId,
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: 'Duyệt', callback_data: `gm:approve:${groupId}:${uid}` },
+                  { text: 'Từ chối', callback_data: `gm:reject:${groupId}:${uid}` },
+                ]],
+              },
+            },
+          );
+        }
+        return;
+      }
+
+      const renamedTo = parseGroupRename(type, data);
+      if (renamedTo) {
+        const topicId = store.getTopicByZalo(groupId, 1);
+        if (topicId !== undefined) {
+          await tg.editForumTopic(
+            config.telegram.groupId,
+            topicId,
+            { name: topicName(renamedTo, 1) },
+          );
+          const existing = store.getEntryByTopic(topicId);
+          if (existing) store.set({ ...existing, name: renamedTo });
+          invalidateCachedGroupInfo(groupId);
+        }
+        return;
+      }
 
       if (type === 'update_board' || type === 'remove_board') {
         const rawParams = data?.groupTopic?.params ?? data?.topic?.params ?? '';
@@ -178,7 +327,19 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
               );
             } catch { /* ignore */ }
             if (detail?.options) {
-              const actorName = data?.updateMembers?.[0]?.dName ?? data?.creatorId ?? '';
+              const actorMember = data?.updateMembers?.[0] as GroupEventMember | undefined;
+              const actorUid = actorMember
+                ? groupEventMemberUid(actorMember)
+                : String(data?.creatorId ?? '');
+              const actorFallback = typeof actorMember?.dName === 'string'
+                ? actorMember.dName
+                : actorUid;
+              const actorName = await resolveUserDisplayName(
+                api,
+                actorUid || undefined,
+                actorFallback,
+                groupId,
+              );
               const header = actorName ? `${actorName} vừa bình chọn` : 'Cập nhật bình chọn';
               const scoreText = buildScoreText(header, detail.options, detail.closed ?? false);
               console.log(`[ZaloHandler] Poll ${pollId} update:`, detail.options.map((o: { content: string; votes: number }) => `${o.content}=${o.votes}`).join(', '));
@@ -221,8 +382,8 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
       const topicId = store.getTopicByZalo(groupId, 1);
       if (topicId === undefined) return;
 
-      const members: Array<{ dName?: string }> = data?.updateMembers ?? [];
-      const names = members.map(m => m.dName ?? '?').join(', ');
+      const members: GroupEventMember[] = data?.updateMembers ?? [];
+      const names = await resolveGroupEventMemberNames(api, members, groupId);
       const actor  = data?.creatorId === data?.sourceId ? '' : '';
       void actor;
 
@@ -260,22 +421,7 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
       const fromUid = data?.fromUid;
       if (!fromUid) return;
 
-      let displayName = fromUid;
-      try {
-        const info = await runZaloRequest(
-          { label: `getUserInfo(friend:${fromUid})`, priority: 'low', maxRetries: 0 },
-          () => api.getUserInfo(fromUid),
-        ) as {
-          display_name?: string;
-          zaloName?: string;
-          changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
-          unchanged_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
-        } | undefined;
-        const profile = info?.changed_profiles?.[fromUid] ?? info?.unchanged_profiles?.[fromUid];
-        displayName = info?.display_name ?? profile?.displayName ?? info?.zaloName ?? profile?.zaloName ?? fromUid;
-      } catch {
-        // Keep UID fallback when profile lookup fails.
-      }
+      const displayName = await resolveUserDisplayName(api, fromUid, fromUid);
 
       const requestMessage = data?.message?.trim();
       await tg.sendMessage(
@@ -294,6 +440,65 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
       console.log(`[ZaloHandler] FriendEvent REQUEST from ${fromUid} (${displayName})`);
     } catch (err) {
       console.error('[ZaloHandler] FriendEvent error:', err);
+    }
+  });
+
+  const typingForwardedAt = new Map<string, number>();
+  const typingThrottleMs = 4_000;
+
+  api.listener.on('typing', async (typing: any) => {
+    try {
+      const zaloId = String(
+        typing?.threadId ?? typing?.data?.gid ?? typing?.data?.uid ?? '',
+      );
+      if (!zaloId) return;
+      const type = typing?.type === ThreadType.Group || typing?.data?.gid ? 1 : 0;
+      const topicId = store.getTopicByZalo(zaloId, type as 0 | 1);
+      if (topicId === undefined) return;
+      const now = Date.now();
+      if (now - (typingForwardedAt.get(zaloId) ?? 0) < typingThrottleMs) return;
+      typingForwardedAt.set(zaloId, now);
+      await tg.sendChatAction(
+        config.telegram.groupId,
+        'typing',
+        { message_thread_id: topicId },
+      );
+    } catch (error) {
+      console.warn('[ZaloHandler] Typing error:', error);
+    }
+  });
+
+  const seenTelegramMessageIds = new Set<number>();
+  const seenDedupeMax = 2_000;
+
+  api.listener.on('seen_messages', async (messages: any[]) => {
+    if (!Array.isArray(messages)) return;
+    for (const message of messages) {
+      try {
+        const data = message?.data ?? {};
+        const candidates = [data.msgId, data.realMsgId, data.cliMsgId]
+          .map((id: unknown) => id === undefined || id === null ? '' : String(id).trim())
+          .filter((id: string) => id && id !== '0');
+        let telegramMessageId: number | undefined;
+        for (const candidate of candidates) {
+          telegramMessageId = sentMsgStore.getByZaloMsgId(candidate)
+            ?? msgStore.getTgMsgId(candidate);
+          if (telegramMessageId !== undefined) break;
+        }
+        if (
+          telegramMessageId === undefined
+          || seenTelegramMessageIds.has(telegramMessageId)
+        ) continue;
+        if (seenTelegramMessageIds.size >= seenDedupeMax) seenTelegramMessageIds.clear();
+        seenTelegramMessageIds.add(telegramMessageId);
+        await tg.setMessageReaction(
+          config.telegram.groupId,
+          telegramMessageId,
+          [{ type: 'emoji', emoji: '👀' }] as Parameters<typeof tg.setMessageReaction>[2],
+        );
+      } catch (error) {
+        console.warn('[ZaloHandler] Seen error:', error);
+      }
     }
   });
 }

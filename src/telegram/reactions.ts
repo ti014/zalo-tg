@@ -1,107 +1,114 @@
 import type { TgHandlerContext } from './types.js';
-import { msgStore, reactionEchoStore } from '../store/index.js';
+import {
+  msgStore,
+  sentMsgStore,
+  reactionEchoStore,
+  reactionEventDedupeStore,
+} from '../store/index.js';
+import { recallTelegramMappedMessage } from '../application/zalo-recall.js';
+import {
+  TELEGRAM_TO_ZALO_REACTION,
+} from '../zalo/reaction.js';
 import { runZaloRequest } from '../zalo/rate-limit.js';
+
+const RECALL_TRIGGER_EMOJI = '🙈';
 
 export function registerReactionHandler({ bot, getApi }: TgHandlerContext): void {
   bot.on('message_reaction', async (ctx) => {
     try {
       const currentApi = getApi();
-      if (!currentApi) return;
+      if (!currentApi || !ctx.messageReaction) return;
       const update = ctx.messageReaction;
-      if (!update) return;
 
       type EmojiReaction = { type: 'emoji'; emoji: string };
-      const isEmoji = (r: { type: string }): r is EmojiReaction => r.type === 'emoji';
+      const isEmoji = (reaction: { type: string }): reaction is EmojiReaction => (
+        reaction.type === 'emoji'
+      );
       const oldEmojis = new Set(
         update.old_reaction
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          .filter(r => isEmoji(r as any))
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          .map(r => (r as any).emoji as string),
+          .filter(reaction => isEmoji(reaction as { type: string }))
+          .map(reaction => (reaction as EmojiReaction).emoji),
       );
       const added = update.new_reaction
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        .filter(r => isEmoji(r as any) && !oldEmojis.has((r as any).emoji as string));
-
+        .filter(reaction => (
+          isEmoji(reaction as { type: string })
+          && !oldEmojis.has((reaction as EmojiReaction).emoji)
+        ))
+        .map(reaction => (reaction as EmojiReaction).emoji);
       if (added.length === 0) return;
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const tgEmoji = (added[0] as any).emoji as string;
+      const tgEmoji = added[0]!;
+      const tgMessageId = update.message_id;
+      const actorId = String(
+        (update as unknown as { user?: { id?: number }; actor_chat?: { id?: number } }).user?.id
+          ?? (update as unknown as { actor_chat?: { id?: number } }).actor_chat?.id
+          ?? 'unknown',
+      );
+      const chatId = Number(
+        (update as unknown as { chat?: { id?: number } }).chat?.id
+          ?? ctx.chat?.id
+          ?? 0,
+      );
 
-      const TG_TO_ZALO: Record<string, string> = {
-        '❤':  '/-heart',
-        '❤️': '/-heart',
-        '👍':  '/-strong',
-        '👎':  '/-weak',
-        '😄':  ':>',
-        '😁':  ':>',
-        '😢':  ':-((',
-        '😭':  ':((',
-        '😮':  ':o',
-        '😱':  ':o',
-        '😡':  ':-h',
-        '🤬':  ':-h',
-        '😘':  ':-*',
-        '🥰':  ';xx',
-        '😍':  ';xx',
-        '🤣':  ":'>",
-        '😂':  ":'>",
-        '💩':  '/-shit',
-        '🌹':  '/-rose',
-        '💔':  '/-break',
-        '😕':  ';-/',
-        '🤔':  ';-/',
-        '😉':  ';-)',
-        '👌':  '/-ok',
-        '✌️':  '/-v',
-        '✌':  '/-v',
-        '🙏':  '_()_',
-        '👊':  '/-punch',
-        '🤯':  ':o',
-        '🎉':  '/-bd',
-        '🏆':  '/-ok',
-        '💯':  '/-ok',
-        '😎':  'x-)',
-        '🤩':  'x-)',
-        '🔥':  '/-heart',
-      };
+      if (reactionEventDedupeStore.isDuplicateTgOutbound({
+        chatId,
+        messageId: tgMessageId,
+        actorId,
+        emoji: tgEmoji,
+      })) return;
 
-      const zaloIcon = TG_TO_ZALO[tgEmoji];
-      if (!zaloIcon) {
-        console.log(`[TG→Zalo] Reaction: no Zalo map for TG emoji "${tgEmoji}"`);
+      if (tgEmoji === RECALL_TRIGGER_EMOJI) {
+        try {
+          await recallTelegramMappedMessage(currentApi, tgMessageId);
+          await ctx.telegram.deleteMessage(chatId, tgMessageId).catch(error => {
+            console.warn('[TG→Zalo] Recall reaction deleted Zalo copy but not Telegram copy:', error);
+          });
+        } catch (error) {
+          await ctx.telegram.sendMessage(
+            chatId,
+            'Không thu hồi được tin nhắn trên Zalo. Chỉ tin nhắn của bạn trong thời hạn Zalo cho phép mới thu hồi được.',
+            {
+              message_thread_id: (update as unknown as { message_thread_id?: number }).message_thread_id,
+            },
+          ).catch(() => undefined);
+          console.warn('[TG→Zalo] Recall reaction failed:', error);
+        }
         return;
       }
 
-      const tgMsgId = update.message_id;
-      const quote   = msgStore.getQuote(tgMsgId);
-      if (!quote) {
-        console.log(`[TG→Zalo] Reaction: no Zalo quote for TG msg ${tgMsgId}`);
-        return;
-      }
+      const zaloIcon = TELEGRAM_TO_ZALO_REACTION[tgEmoji];
+      if (!zaloIcon) return;
 
-      const { ThreadType } = await import('zca-js');
-      const zaloThreadType = quote.threadType === 1 ? ThreadType.Group : ThreadType.User;
+      const quote = msgStore.getQuote(tgMessageId);
+      const sent = sentMsgStore.get(tgMessageId);
+      const zaloId = quote?.zaloId ?? sent?.zaloId;
+      const zaloMsgId = quote?.msgId ?? sent?.msgId;
+      if (!zaloId || zaloMsgId === undefined) return;
+      const cliMsgId = quote?.cliMsgId ?? sent?.cliMsgId;
+      const threadType = quote?.threadType ?? sent?.threadType ?? 0;
+      const zaloThreadType = threadType === 1
+        ? (await import('zca-js')).ThreadType.Group
+        : (await import('zca-js')).ThreadType.User;
 
-      reactionEchoStore.mark(quote.zaloId, quote.msgId, zaloIcon);
+      reactionEchoStore.mark(zaloId, String(zaloMsgId), zaloIcon);
       try {
         await runZaloRequest(
-          { label: `addReaction(${quote.zaloId})`, priority: 'high' },
+          { label: `addReaction(${zaloId})`, priority: 'high' },
           () => currentApi.addReaction(
             { rType: 0, source: 0, icon: zaloIcon },
             {
-              data: { msgId: quote.msgId, cliMsgId: quote.cliMsgId },
-              threadId: quote.zaloId,
+              data: { msgId: zaloMsgId, cliMsgId },
+              threadId: zaloId,
               type: zaloThreadType,
             },
           ),
         );
-      } catch (err) {
-        reactionEchoStore.cancel(quote.zaloId, quote.msgId, zaloIcon);
-        throw err;
+      } catch (error) {
+        reactionEchoStore.cancel(zaloId, String(zaloMsgId), zaloIcon);
+        throw error;
       }
-      console.log(`[TG→Zalo] Reaction "${tgEmoji}" → Zalo "${zaloIcon}" on msg ${quote.msgId}`);
-    } catch (err) {
-      console.error('[TG→Zalo] Reaction error:', err);
+    } catch (error) {
+      console.error('[TG→Zalo] Reaction error:', error);
     }
   });
 }

@@ -22,4 +22,5 @@ export interface TgHandlerContext {
   onZaloLogin: (api: ZaloAPI) => Promise<void>;
   deliveryRepository?: DeliveryRepository;
   prepareMappingClear?: () => MappingClearPreparation;
+  requestRestart?: () => boolean;
 }

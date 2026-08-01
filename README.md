@@ -16,6 +16,8 @@ The bridge runs as one long-lived Node.js process. SQLite and a Docker named vol
 - At-least-once delivery, retry, leases, provider receipts, and operator-visible `UNKNOWN` results.
 - Durable media spool with size limits, expiry cleanup, and multipart Telegram uploads.
 - QR-based Zalo authentication through Telegram.
+- Web and PC-App QR login, full group/member lookup, history backfill, offline auto-reply, and friend-request administration.
+- Optional local Telegram Bot API deployment with a path-scoped shared volume and safe multipart fallback.
 - Deployment preflight, SQLite instance lease, liveness, and readiness checks.
 - Hardened Docker runtime: non-root user, read-only root filesystem, dropped capabilities, resource limits, and an external named volume.
 
@@ -116,6 +118,15 @@ The service does not publish a host port because it uses Telegram long polling. 
 npm run docker:seed
 ~~~
 
+For opt-in local Telegram Bot API transfers, set `TG_API_ID` and `TG_API_HASH`, then add the maintained overlay:
+
+~~~powershell
+docker compose -f compose.yaml -f compose.local-bot-api.yaml config --quiet
+docker compose -f compose.yaml -f compose.local-bot-api.yaml up -d --build
+~~~
+
+The overlay does not publish port 8081. It mounts one dedicated volume at the same absolute path in both containers; Zalo credentials and SQLite data are not exposed to the Bot API service.
+
 ### 5. Verify the deployment
 
 ~~~powershell
@@ -190,8 +201,8 @@ Copy `.env.example` to `.env`. Invalid required IDs, booleans, numbers, or produ
 
 | Variable | Default | Limit or effect |
 | --- | ---: | --- |
-| `TG_DOWNLOAD_MAX_MB` | 20 | Maximum 200 MB |
-| `TG_UPLOAD_PART_MB` | 45 | Maximum 200 MB |
+| `TG_DOWNLOAD_MAX_MB` | 20 | Maximum 200 MB with cloud API; 2048 MB in local mode |
+| `TG_UPLOAD_PART_MB` | 45 | Maximum 200 MB with cloud API; 2048 MB in local mode |
 | `TG_UPLOAD_TIMEOUT_SEC` | 600 | Maximum 3600 seconds |
 | `MEDIA_MAX_OBJECT_MB` | 200 | Maximum 2048 MB |
 | `MEDIA_SPOOL_MAX_MB` | 5120 | Maximum 102400 MB |
@@ -200,8 +211,14 @@ Copy `.env.example` to `.env`. Invalid required IDs, booleans, numbers, or produ
 | `ZALO_SKIP_MUTED_GROUPS` | false | Skip messages from muted groups |
 | `ZALO_SKIP_STRANGER_MESSAGES` | false | Skip DMs from non-friends |
 | `UPDATE_CHECK_ENABLED` | false in production | Enable update notifications |
+| `UPDATE_REPOSITORY` | `williamcachamwri/zalo-tg` | Public GitHub upstream checked read-only |
+| `UPSTREAM_BASE_REVISION` | `155b6cc` | Last upstream commit audited into this fork |
 | `ALLOW_SECRET_BACKUP` | false | Permit backups containing secrets |
+| `RESTART_ON_COMMAND` | false; true in production Compose | Allow `/restart` only under a process supervisor |
 | `TG_API_ROOT` | unset | Optional custom Bot API root; read `docs/operations.md` first |
+| `LOCAL_BOT_API` | false | Enable local Bot API file semantics |
+| `TG_LOCAL_SERVER` | unset | Local Bot API URL, normally `http://telegram-bot-api:8081` |
+| `ZALO_TG_SHARED_TMP_ROOT` | OS temp | Absolute path shared with the local Bot API service; overlay uses `/var/lib/telegram-bot-api` |
 
 Boolean values accept `1/true/yes/on` and `0/false/no/off`.
 
@@ -210,15 +227,19 @@ Boolean values accept `1/true/yes/on` and `0/false/no/off`.
 | Command | Purpose |
 | --- | --- |
 | `/login` | Start QR-based Zalo login |
+| `/loginweb`, `/loginapp` | Select Web or PC-App login; App mode refreshes hidden-member data |
 | `/status` | Show bridge and provider status |
 | `/topic list\|info\|delete` | Inspect or remove topic mappings |
 | `/search <query>` | Search friends and create a direct-message topic |
 | `/addfriend`, `/friendrequests` | Manage Zalo friend requests |
 | `/addgroup`, `/joingroup`, `/leavegroup` | Manage Zalo groups |
+| `/group_info`, `/group_infoall`, `/history` | Inspect groups and replay recent history through the durable relay |
+| `/autoreply` | Configure opt-in delayed DM auto-reply with durable cooldown reservations |
 | `/recall` | Recall a bot-originated Zalo message |
 | `/queue` | Inspect queue, retry, and `UNKNOWN` deliveries |
 | `/backup`, `/restore` | Controlled application backup/restore flows |
 | `/settings`, `/members`, `/kick`, `/clear` | Administrative operations |
+| `/seed`, `/admin`, `/update`, `/restart` | Operator diagnostics, update check, and supervised restart |
 | `/help`, `/menu` | Show the current command catalog |
 
 Privileged actions are restricted by `TG_OWNER_IDS`. Keep the group private because normal members can still relay messages.
@@ -335,7 +356,7 @@ src/
 ├── tools/                           Docker seed/verify and TGS conversion
 └── utils/                           format, downloads, media, Telegram queue
 tests/                               Node-based TypeScript tests
-compose*.yaml                        production, development, and seed overlays
+compose*.yaml                        production, development, seed, and local Bot API overlays
 Dockerfile                           multi-stage production image
 docs/operations.md                   production runbook
 scripts/                             PowerShell backup and restore
@@ -346,4 +367,3 @@ scripts/                             PowerShell backup and restore
 Before opening a pull request, run `npm run build`, `npm test`, relevant Docker validation, and `git diff --check`. Keep behavior, operations documentation, and tests aligned; never add secrets or generated data.
 
 No license file is present. Reuse and redistribution require project-owner approval until a license is added.
-

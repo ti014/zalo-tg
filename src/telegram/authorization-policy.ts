@@ -15,6 +15,16 @@ const OWNER_COMMANDS = new Set([
   'search',
   'settings',
   'topic',
+  'autoreply',
+  'group_info',
+  'group_infoall',
+  'history',
+  'seed',
+  'admin',
+  'update',
+  'restart',
+  'loginweb',
+  'loginapp',
 ]);
 
 const TELEGRAM_GROUP_ANONYMOUS_BOT_ID = 1087968824;

@@ -2,7 +2,7 @@ import { readFileSync, existsSync } from 'fs';
 import path from 'path';
 import { config } from '../config.js';
 import { MessageLinkCache } from '../domain/message-links.js';
-import { normalizeMessageId } from '../domain/message-id.js';
+import { normalizeMessageId, normalizeMessageIds } from '../domain/message-id.js';
 import {
   PendingSendRegistry,
   type PendingEchoInput,
@@ -34,8 +34,17 @@ export interface ZaloQuoteData {
 export interface SentMsgInfo {
   msgId:      string | number;
   cliMsgId?:  string | number;
+  msgIds?:    Array<string | number>;
   zaloId:     string;
   threadType: 0 | 1;
+}
+
+export function sentMessageIds(info: SentMsgInfo): string[] {
+  return normalizeMessageIds([info.msgId, ...(info.msgIds ?? [])]);
+}
+
+export function sentMessageAliases(info: SentMsgInfo): string[] {
+  return normalizeMessageIds([...sentMessageIds(info), info.cliMsgId]);
 }
 
 const MSG_CACHE_MAX = 2000;
@@ -93,15 +102,12 @@ function _parseMsgMap(content: string): MsgMapData {
 }
 
 function _indexSent(tgMsgId: number, info: SentMsgInfo): void {
-  const msgId = normalizeMessageId(info.msgId);
-  const cliMsgId = normalizeMessageId(info.cliMsgId);
-  if (msgId) _sentByZaloId.set(msgId, tgMsgId);
-  if (cliMsgId) _sentByZaloId.set(cliMsgId, tgMsgId);
+  for (const alias of sentMessageAliases(info)) _sentByZaloId.set(alias, tgMsgId);
 }
 
 function _unindexSent(tgMsgId: number, info: SentMsgInfo): void {
-  for (const alias of [normalizeMessageId(info.msgId), normalizeMessageId(info.cliMsgId)]) {
-    if (alias && _sentByZaloId.get(alias) === tgMsgId) _sentByZaloId.delete(alias);
+  for (const alias of sentMessageAliases(info)) {
+    if (_sentByZaloId.get(alias) === tgMsgId) _sentByZaloId.delete(alias);
   }
 }
 
@@ -129,7 +135,8 @@ function _normalizeMsgMap(saved: MsgMapData): { data: MsgMapData; normalized: bo
     }
     const [telegramId, rawInfo] = entry;
     const info = rawInfo as Partial<SentMsgInfo> | undefined;
-    const msgId = normalizeMessageId(info?.msgId) ?? normalizeMessageId(info?.cliMsgId);
+    const allMsgIds = normalizeMessageIds([info?.msgId, ...(info?.msgIds ?? [])]);
+    const msgId = allMsgIds[0] ?? normalizeMessageId(info?.cliMsgId);
     const cliMsgId = normalizeMessageId(info?.cliMsgId);
     if (!info || !msgId || typeof info.zaloId !== 'string' || (info.threadType !== 0 && info.threadType !== 1)) {
       normalized = true;
@@ -143,6 +150,7 @@ function _normalizeMsgMap(saved: MsgMapData): { data: MsgMapData; normalized: bo
     sentByTelegram.set(telegramId, {
       msgId,
       ...(cliMsgId ? { cliMsgId } : {}),
+      ...(allMsgIds.length > 1 ? { msgIds: allMsgIds } : {}),
       zaloId: info.zaloId,
       threadType: info.threadType,
     });
@@ -278,6 +286,15 @@ export const msgStore = {
   loadState(): { status: LoadStatus; error?: Error } {
     return { status: _loadStatus, ...(_loadFailure ? { error: _loadFailure } : {}) };
   },
+
+  stats(): { aliases: number; quotes: number; maxAliases: number } {
+    const snapshot = _messageLinks.snapshot();
+    return {
+      aliases: snapshot.pairs.length,
+      quotes: snapshot.quotes.length,
+      maxAliases: MSG_CACHE_MAX,
+    };
+  },
 };
 
 export const sentMsgStore = {
@@ -313,6 +330,33 @@ export const sentMsgStore = {
     return tgMsgId === undefined ? undefined : this.update(tgMsgId, patch);
   },
 
+  append(
+    tgMsgId: number,
+    info: { msgId: string | number; cliMsgId?: string | number; zaloId: string; threadType: 0 | 1 },
+  ): SentMsgInfo {
+    const existing = this.get(tgMsgId);
+    if (!existing) {
+      const created: SentMsgInfo = { ...info };
+      this.save(tgMsgId, created);
+      return created;
+    }
+    if (existing.zaloId !== info.zaloId || existing.threadType !== info.threadType) {
+      throw new Error(`Cannot append a Zalo alias from another conversation to Telegram ${tgMsgId}.`);
+    }
+    const ids = normalizeMessageIds([
+      ...sentMessageIds(existing),
+      info.msgId,
+    ]);
+    const next: SentMsgInfo = {
+      ...existing,
+      msgId: ids[0]!,
+      ...(ids.length > 1 ? { msgIds: ids } : {}),
+      ...(info.cliMsgId === undefined ? {} : { cliMsgId: info.cliMsgId }),
+    };
+    this.save(tgMsgId, next);
+    return next;
+  },
+
   get(tgMsgId: number): SentMsgInfo | undefined {
     return _sentMap.get(tgMsgId)
       ?? lookupShadowSentInfo(tgMsgId);
@@ -321,6 +365,14 @@ export const sentMsgStore = {
   getByZaloMsgId(zaloMsgId: string): number | undefined {
     return _sentByZaloId.get(zaloMsgId)
       ?? lookupShadowSentTelegramIdByAlias(zaloMsgId);
+  },
+
+  stats(): { entries: number; aliases: number; maxEntries: number } {
+    return {
+      entries: _sentMap.size,
+      aliases: _sentByZaloId.size,
+      maxEntries: SENT_MAX,
+    };
   },
 
 };

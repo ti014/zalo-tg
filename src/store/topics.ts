@@ -139,4 +139,14 @@ export const store = {
   loadState(): { status: LoadStatus; error?: Error } {
     return { status: loadStatus, ...(loadFailure ? { error: loadFailure } : {}) };
   },
+
+  stats(): { topics: number; groups: number; directMessages: number } {
+    const entries = Object.values(_data.topics);
+    const groups = entries.filter(entry => entry.type === 1).length;
+    return {
+      topics: entries.length,
+      groups,
+      directMessages: entries.length - groups,
+    };
+  },
 };

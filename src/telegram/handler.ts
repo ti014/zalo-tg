@@ -28,6 +28,7 @@ export interface TelegramHandlerOptions {
   deliveryRepository?: DeliveryRepository;
   onFatal?: (error: Error) => void;
   prepareMappingClear?: () => MappingClearPreparation;
+  requestRestart?: () => boolean;
 }
 
 export function setupTelegramHandler(
@@ -73,6 +74,7 @@ export function setupTelegramHandler(
     onZaloLogin,
     deliveryRepository: options.deliveryRepository,
     prepareMappingClear: options.prepareMappingClear,
+    requestRestart: options.requestRestart,
   };
 
   registerOwnerAuthorization(tgBot);

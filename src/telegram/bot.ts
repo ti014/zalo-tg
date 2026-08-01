@@ -32,11 +32,23 @@ export const GROUP_BOT_COMMANDS = [
   { command: 'backup', description: 'Xuất backup logic' },
   { command: 'restore', description: 'Khôi phục backup logic' },
   { command: 'login', description: 'Đăng nhập Zalo bằng QR' },
+  { command: 'loginweb', description: 'Đăng nhập Zalo bằng QR Web' },
+  { command: 'loginapp', description: 'Đăng nhập Zalo qua PC App API' },
+  { command: 'autoreply', description: 'Cấu hình auto-reply DM' },
+  { command: 'group_info', description: 'Xem thông tin nhóm Zalo' },
+  { command: 'group_infoall', description: 'Xem toàn bộ thành viên nhóm' },
+  { command: 'history', description: 'Nạp lịch sử nhóm Zalo' },
+  { command: 'seed', description: 'Xem mã seed giải mã backup Zalo' },
+  { command: 'admin', description: 'Xem trạng thái, cache và mapping' },
+  { command: 'update', description: 'Kiểm tra phiên bản mới' },
+  { command: 'restart', description: 'Khởi động lại bridge có kiểm soát' },
   { command: 'help', description: 'Xem hướng dẫn' },
 ] as const;
 
 export const PRIVATE_BOT_COMMANDS = [
   { command: 'login', description: 'Đăng nhập Zalo bằng QR' },
+  { command: 'loginweb', description: 'Đăng nhập Zalo bằng QR Web' },
+  { command: 'loginapp', description: 'Đăng nhập Zalo qua PC App API' },
 ] as const;
 
 const COMMAND_SYNC_ATTEMPTS = 3;

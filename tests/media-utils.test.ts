@@ -8,9 +8,12 @@ import {
   cleanTemp,
   compressGifForZalo,
   convertImageToGif,
+  convertSpriteSheetToGif,
   convertTgsToGif,
   convertVideoToMp4,
   DownloadSizeLimitError,
+  getSpriteSheetLayout,
+  sanitizeFileName,
   splitFileForTelegram,
 } from '../src/utils/media.js';
 
@@ -28,6 +31,56 @@ test('large file splitting is lossless and cleanTemp never deletes outside manag
     await cleanTemp(sourcePath);
     assert.deepEqual(readFileSync(sourcePath), source);
   } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Unicode filenames remain readable while path and control characters are removed', () => {
+  const sanitized = sanitizeFileName('../Báo cáo quý 1?.pdf');
+  assert.match(sanitized, /Báo cáo quý 1_\.pdf$/u);
+  assert.doesNotMatch(sanitized, /[\\/:*?"<>|]/u);
+  assert.equal(sanitizeFileName('CON'), '_CON');
+});
+
+test('Zalo sticker sprite layout supports declared and inferred strips', () => {
+  assert.deepEqual(getSpriteSheetLayout(96, 32, 3), {
+    frames: 3,
+    frameWidth: 32,
+    frameHeight: 32,
+    direction: 'horizontal',
+  });
+  assert.deepEqual(getSpriteSheetLayout(24, 72), {
+    frames: 3,
+    frameWidth: 24,
+    frameHeight: 24,
+    direction: 'vertical',
+  });
+  assert.deepEqual(getSpriteSheetLayout(40, 30, 7), {
+    frames: 1,
+    frameWidth: 40,
+    frameHeight: 30,
+    direction: 'horizontal',
+  });
+});
+
+test('Zalo sticker sprite sheets are rendered as animated GIFs', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zalo-sprite-gif-'));
+  const sourcePath = path.join(directory, 'sprite.png');
+  writeFileSync(
+    sourcePath,
+    Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8AAQv8BD/kD/YURmXYAAAAASUVORK5CYII=',
+      'base64',
+    ),
+  );
+  let outputPath: string | undefined;
+  try {
+    outputPath = await convertSpriteSheetToGif(sourcePath, 2, 100);
+    const output = readFileSync(outputPath);
+    assert.match(output.subarray(0, 6).toString('ascii'), /^GIF8[79]a$/);
+    assert.ok(output.length > 100);
+  } finally {
+    if (outputPath) await cleanTemp(outputPath);
     rmSync(directory, { recursive: true, force: true });
   }
 });

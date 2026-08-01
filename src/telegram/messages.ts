@@ -3,7 +3,15 @@ import type { Context, NarrowedContext } from 'telegraf';
 import type { Message, Update } from 'telegraf/types';
 
 import type { TgHandlerContext } from './types.js';
-import { store, msgStore, sentMsgStore, pendingSendStore, mediaGroupStore } from '../store/index.js';
+import {
+  aliasCache,
+  store,
+  msgStore,
+  sentMsgStore,
+  pendingSendStore,
+  mediaGroupStore,
+  userCache,
+} from '../store/index.js';
 import type { MediaGroupItem } from '../store/index.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
@@ -31,10 +39,11 @@ import {
 import { isAmbiguousProviderFailure } from '../domain/provider-errors.js';
 import { downloadTelegramMediaDurably } from '../application/durable-media.js';
 import { isAnonymousAdminUpdate } from './authorization-policy.js';
+import { buildReplyAutoMention, splitZaloText } from '../domain/text-chunks.js';
 
 interface ZaloSendMessageResult {
-  message?: { msgId?: number } | null;
-  attachment?: Array<{ msgId?: number }>;
+  message?: { msgId?: number; cliMsgId?: number } | null;
+  attachment?: Array<{ msgId?: number; cliMsgId?: number }>;
 }
 
 interface ZaloCreatePollResult {
@@ -150,9 +159,67 @@ export async function processTelegramMessage(
           fingerprint: contentFingerprint(fingerprint),
         });
 
-      const saveSentMapping = (zaloMsgId: number): void => {
-        recordDurableTelegramProviderMessageId(zaloMsgId);
-        sentMsgStore.save(msg.message_id, { msgId: zaloMsgId, zaloId, threadType });
+      const saveSentMapping = (
+        zaloMsgId: number,
+        cliMsgId?: number,
+        ordinal = 0,
+      ): void => {
+        recordDurableTelegramProviderMessageId(zaloMsgId, {
+          receiptKind: ordinal === 0 ? 'primary' : 'auxiliary',
+          ordinal,
+          isPrimary: ordinal === 0,
+          providerConversationId: zaloId,
+        });
+        sentMsgStore.append(msg.message_id, {
+          msgId: zaloMsgId,
+          ...(cliMsgId === undefined ? {} : { cliMsgId }),
+          zaloId,
+          threadType,
+        });
+      };
+
+      const saveSendResultMappings = (
+        result: ZaloSendMessageResult | undefined,
+        startOrdinal = 0,
+      ): number[] => {
+        const candidates = [
+          ...(result?.message?.msgId === undefined ? [] : [{
+            msgId: result.message.msgId,
+            cliMsgId: result.message.cliMsgId,
+          }]),
+          ...(result?.attachment ?? []).flatMap(attachment => (
+            attachment.msgId === undefined ? [] : [{
+              msgId: attachment.msgId,
+              cliMsgId: attachment.cliMsgId,
+            }]
+          )),
+        ];
+        const seen = new Set<number>();
+        const ids: number[] = [];
+        for (const candidate of candidates) {
+          if (seen.has(candidate.msgId)) continue;
+          seen.add(candidate.msgId);
+          saveSentMapping(candidate.msgId, candidate.cliMsgId, startOrdinal + ids.length);
+          ids.push(candidate.msgId);
+        }
+        return ids;
+      };
+
+      const replyAutoMention = (replyToMessageId: number | undefined) => {
+        if (replyToMessageId === undefined) return null;
+        const quote = msgStore.getQuote(replyToMessageId);
+        const uid = quote?.uidFrom;
+        const displayName = uid
+          ? aliasCache.get(uid)
+            ?? userCache.getNameInGroup(uid, zaloId)
+            ?? userCache.getName(uid)
+          : undefined;
+        return buildReplyAutoMention({
+          group: threadType === ThreadType.Group,
+          replyIsTelegramOriginated: sentMsgStore.get(replyToMessageId) !== undefined,
+          uid,
+          displayName,
+        });
       };
 
       if ('text' in msg && msg.text) {
@@ -161,46 +228,56 @@ export async function processTelegramMessage(
         const replyToMsgId = msg.reply_to_message?.message_id;
         const zaloQuote = replyToMsgId !== undefined ? msgStore.getQuote(replyToMsgId) : undefined;
 
-        const zaloMentions = resolveTgMentions(
+        const rawMentions = resolveTgMentions(
           msg.text,
           ('entities' in msg ? msg.entities : undefined) as ReadonlyArray<TgEntity> | undefined,
           threadType === ThreadType.Group,
           zaloId,
         );
+        const automaticMention = replyAutoMention(replyToMsgId);
+        const finalText = automaticMention ? automaticMention.prefix + msg.text : msg.text;
+        const zaloMentions = automaticMention
+          ? [
+            automaticMention.mention,
+            ...rawMentions.map(mention => ({
+              ...mention,
+              pos: mention.pos + automaticMention.prefix.length,
+            })),
+          ]
+          : rawMentions;
+        const chunks = splitZaloText(finalText, zaloMentions);
 
-        const pendingToken = beginPendingSend('text', msg.text);
+        const pendingToken = beginPendingSend('text', finalText);
         try {
-          let sendResult = await sendZalo<ZaloSendMessageResult>(
-            'sendMessage',
-            () => api.sendMessage(
-              {
-                msg: msg.text,
-                ...(zaloQuote ? { quote: zaloQuote } : {}),
-                ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
-              },
-              zaloId,
-              threadType,
-            ),
-          ).catch(async (err: unknown) => {
-            if ((err as { code?: number }).code === 114 && zaloQuote) {
-              console.warn('[TG→Zalo] code 114 with quote, retrying without quote');
-              return sendZalo<ZaloSendMessageResult>(
-                'sendMessage(no-quote)',
-                () => api.sendMessage(
-                  {
-                    msg: msg.text,
-                    ...(zaloMentions.length ? { mentions: zaloMentions } : {}),
-                  },
-                  zaloId,
-                  threadType,
-                ),
-              );
+          for (let index = 0; index < chunks.length; index += 1) {
+            const chunk = chunks[index]!;
+            const quote = index === 0 ? zaloQuote : undefined;
+            const sendChunk = (includeQuote: boolean) => sendZalo<ZaloSendMessageResult>(
+              index === 0 ? 'sendMessage' : 'sendMessage(chunk)',
+              () => api.sendMessage(
+                {
+                  msg: chunk.text,
+                  ...(includeQuote && quote ? { quote } : {}),
+                  ...(chunk.mentions.length ? { mentions: chunk.mentions } : {}),
+                },
+                zaloId,
+                threadType,
+              ),
+            );
+            const sendResult = await sendChunk(true).catch(async (error: unknown) => {
+              if ((error as { code?: number }).code === 114 && quote) {
+                console.warn('[TG→Zalo] code 114 with quote, retrying first chunk without quote');
+                return sendChunk(false);
+              }
+              throw error;
+            });
+            const zaloMsgId = sendResult?.message?.msgId;
+            if (zaloMsgId !== undefined) {
+              saveSentMapping(zaloMsgId, sendResult.message?.cliMsgId, index);
             }
-            throw err;
-          });
-          const zaloMsgId = sendResult?.message?.msgId;
-          if (zaloMsgId !== undefined) {
-            saveSentMapping(zaloMsgId);
+            if (index < chunks.length - 1) {
+              await new Promise(resolve => setTimeout(resolve, 500));
+            }
           }
           pendingSendStore.complete(pendingToken);
         } catch (err) {
@@ -275,8 +352,7 @@ export async function processTelegramMessage(
             }
             throw err;
           });
-          const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
-          if (zaloMsgId !== undefined) saveSentMapping(zaloMsgId);
+          saveSendResultMappings(sendResult);
           pendingSendStore.complete(pendingToken);
           console.log(`[TG→Zalo] Send OK: ${filename}`);
         } catch (err) {
@@ -320,10 +396,28 @@ export async function processTelegramMessage(
         const capEntities = ('caption_entities' in msg
           ? (msg as { caption_entities?: ReadonlyArray<TgEntity> }).caption_entities
           : undefined);
-        const capMentions = cap
+        const rawMentions = cap
           ? resolveTgMentions(cap, capEntities, threadType === ThreadType.Group, zaloId)
+          : [];
+        const replyToMessageId = 'reply_to_message' in msg
+          ? (msg as { reply_to_message?: { message_id: number } }).reply_to_message?.message_id
           : undefined;
-        return { cap, capMentions };
+        const automaticMention = replyAutoMention(replyToMessageId);
+        if (!automaticMention) {
+          return { cap, capMentions: rawMentions.length ? rawMentions : undefined };
+        }
+        return {
+          cap: cap
+            ? automaticMention.prefix + cap
+            : automaticMention.prefix.trimEnd(),
+          capMentions: [
+            automaticMention.mention,
+            ...rawMentions.map(mention => ({
+              ...mention,
+              pos: mention.pos + automaticMention.prefix.length,
+            })),
+          ],
+        };
       };
 
       const flushMediaGroup = async (
@@ -364,10 +458,9 @@ export async function processTelegramMessage(
               meta.threadType === 1 ? ThreadType.Group : ThreadType.User,
             ),
           );
-          const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
-          if (zaloMsgId !== undefined) {
-            saveSentMapping(zaloMsgId);
-            console.log(`[TG→Zalo] Media group sent: ${localPaths.length} files, zaloMsgId=${zaloMsgId}`);
+          const zaloMsgIds = saveSendResultMappings(sendResult);
+          if (zaloMsgIds.length > 0) {
+            console.log(`[TG→Zalo] Media group sent: ${localPaths.length} files, zaloMsgIds=${zaloMsgIds.join(',')}`);
           }
           pendingSendStore.complete(pendingToken);
         } catch (err) {
@@ -802,10 +895,7 @@ export async function processTelegramMessage(
                 () => api.sendMessage({ msg: '', attachments: [ultraGifPath] }, zaloId, threadType),
               );
             }
-            const zaloMsgId = sendResult?.message?.msgId ?? sendResult?.attachment?.[0]?.msgId;
-            if (zaloMsgId !== undefined) {
-              saveSentMapping(zaloMsgId);
-            }
+            saveSendResultMappings(sendResult);
             pendingSendStore.complete(pendingToken);
           } catch (err) {
             pendingSendStore.cancel(pendingToken);

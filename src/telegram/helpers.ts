@@ -1,10 +1,13 @@
-import { createReadStream } from 'fs';
-import { userCache } from '../store/index.js';
+import { aliasCache, userCache } from '../store/index.js';
 import { tgBot } from './bot.js';
 import { config } from '../config.js';
 import { escapeHtml } from '../utils/format.js';
 import { triggerQRLogin } from '../zalo/client.js';
+import { triggerAppLogin } from '../zalo/login-app.js';
+import { invalidateAppSession } from '../zalo/app-api.js';
 import type { ZaloAPI } from '../zalo/types.js';
+import { resetMemberCacheLoaded } from '../zalo/helpers.js';
+import { telegramMediaInput, withTelegramMediaFallback } from './media-input.js';
 
 export type TgEntity = { type: string; offset: number; length: number; user?: { first_name: string; last_name?: string } };
 
@@ -17,9 +20,10 @@ export function resolveTgMentions(
   const result: Array<{ pos: number; uid: string; len: number }> = [];
   if (!forZaloGroup) return result;
 
-  const resolveName = (rawName: string) => zaloId
-    ? userCache.resolveByNameInGroup(rawName, zaloId)
-    : userCache.resolveByName(rawName);
+  const resolveName = (rawName: string) => aliasCache.resolveByAlias(rawName)
+    ?? (zaloId
+      ? userCache.resolveByNameInGroup(rawName, zaloId)
+      : userCache.resolveByName(rawName));
 
   if (entities) {
     for (const e of entities) {
@@ -100,14 +104,17 @@ export async function handleLoginCommand(
 
     const newApi = await triggerQRLogin({
       onQRReady: async (imagePath) => {
-        await tgBot.telegram.sendPhoto(
-          chatId,
-          { source: createReadStream(imagePath) },
-          {
-            ...msgOpts,
-            caption: '📱 Mở ứng dụng <b>Zalo</b> → Cài đặt → Quét mã QR để đăng nhập.',
-            parse_mode: 'HTML',
-          },
+        await withTelegramMediaFallback(
+          forceMultipart => tgBot.telegram.sendPhoto(
+            chatId,
+            telegramMediaInput(imagePath, forceMultipart),
+            {
+              ...msgOpts,
+              caption: '📱 Mở ứng dụng <b>Zalo</b> → Cài đặt → Quét mã QR để đăng nhập.',
+              parse_mode: 'HTML',
+            },
+          ),
+          'Web login QR upload',
         );
       },
       onExpired: async () => {
@@ -132,12 +139,64 @@ export async function handleLoginCommand(
       },
     });
 
+    invalidateAppSession();
+    resetMemberCacheLoaded();
     onNewApi(newApi);
   } catch (err) {
     await tgBot.telegram.sendMessage(
       chatId,
       `❌ Đăng nhập thất bại: ${String(err)}`,
       msgOpts,
+    ).catch(() => undefined);
+  } finally {
+    qrLoginInProgress = false;
+  }
+}
+
+export async function handleAppLoginCommand(
+  chatId: number,
+  threadId: number | undefined,
+  onNewApi: (api: ZaloAPI) => void,
+): Promise<void> {
+  if (qrLoginInProgress) {
+    await tgBot.telegram.sendMessage(
+      chatId,
+      '⏳ Đang có phiên đăng nhập Web đang chạy. Vui lòng chờ...',
+      threadId ? { message_thread_id: threadId } : {},
+    );
+    return;
+  }
+
+  qrLoginInProgress = true;
+  const msgOpts = threadId ? { message_thread_id: threadId } : {};
+  try {
+    await tgBot.telegram.sendMessage(chatId, '🔄 Đang tạo mã QR Zalo (PC App API)...', msgOpts);
+    const newApi = await triggerAppLogin({
+      onQRReady: async (imagePath) => {
+        await withTelegramMediaFallback(
+          forceMultipart => tgBot.telegram.sendPhoto(
+            chatId,
+            telegramMediaInput(imagePath, forceMultipart),
+            { ...msgOpts, caption: '📱 Quét mã QR bằng ứng dụng Zalo.', parse_mode: 'HTML' },
+          ),
+          'PC-App login QR upload',
+        );
+      },
+      onScanned: async () => {
+        await tgBot.telegram.sendMessage(chatId, '✅ Đã quét! Đang lấy thông tin đăng nhập...', msgOpts);
+      },
+      onSuccess: async () => {
+        await tgBot.telegram.sendMessage(chatId, '🎉 Đăng nhập Zalo (PC App API) thành công!', msgOpts);
+      },
+    });
+    invalidateAppSession();
+    resetMemberCacheLoaded();
+    onNewApi(newApi);
+  } catch (error) {
+    await tgBot.telegram.sendMessage(
+      chatId,
+      `❌ Đăng nhập App thất bại: ${escapeHtml(String(error))}`,
+      { ...msgOpts, parse_mode: 'HTML' },
     ).catch(() => undefined);
   } finally {
     qrLoginInProgress = false;

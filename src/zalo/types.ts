@@ -27,6 +27,9 @@ export interface ZaloMediaContent {
   // contact card (chat.forward msgType 6)
   contactUid?:  string;
   qrCodeUrl?:   string;
+  src?:          string;
+  msg?:          string;
+  desc?:         string;
 }
 
 /** Zalo message types (value of data.msgType). */
@@ -45,6 +48,7 @@ export const ZALO_MSG_TYPES = {
   POLL:       'group.poll',
   // Contact card (shared profile) — Zalo sends as 'chat.forward' with msgType 6
   CONTACT:    'chat.forward',
+  ECARD:      'chat.ecard',
 } as const;
 
 /** A single @mention inside a Zalo group message. */
@@ -81,6 +85,7 @@ export interface ZaloMessageData {
   ttl?:       number;
   quote?:     ZaloTQuote;
   mentions?:  ZaloTMention[];  // group messages only
+  textProperties?: string;
 }
 
 export interface ZaloMessage {

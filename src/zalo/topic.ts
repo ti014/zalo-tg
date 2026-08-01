@@ -1,5 +1,4 @@
 import { ThreadType } from 'zca-js';
-import { createReadStream } from 'fs';
 
 import { store } from '../store/index.js';
 import { config } from '../config.js';
@@ -8,13 +7,20 @@ import { topicName, escapeHtml } from '../utils/format.js';
 import { tg } from './helpers.js';
 import { isTopicUnavailableError } from '../domain/topic-errors.js';
 import { sendWithOneTopicRetry } from '../domain/topic-retry.js';
+import { telegramMediaInput, withTelegramMediaFallback } from '../telegram/media-input.js';
 
 const _pendingTopics = new Map<string, Promise<number>>();
 
-function shouldReplaceStoredName(currentName: string, nextName: string, zaloId: string): boolean {
+export function shouldReplaceStoredName(
+  currentName: string,
+  nextName: string,
+  zaloId: string,
+  type: 0 | 1,
+): boolean {
   const current = currentName.trim();
   const next = nextName.trim();
   if (!next || current === next) return false;
+  if (type === ThreadType.User) return true;
   if (current === zaloId) return true;
   return /^\d{8,}$/.test(current) && !/^\d{8,}$/.test(next);
 }
@@ -31,9 +37,18 @@ export async function getOrCreateTopic(
     if (existing !== undefined) {
       if (existing > 1) {
         const entry = store.getEntryByTopic(existing);
-        if (entry && shouldReplaceStoredName(entry.name, displayName, zaloId)) {
-          store.set({ ...entry, name: displayName });
-          tg.editForumTopic(config.telegram.groupId, existing, { name: topicName(displayName, type) }).catch(() => undefined);
+        if (entry && shouldReplaceStoredName(entry.name, displayName, zaloId, type)) {
+          try {
+            await tg.editForumTopic(
+              config.telegram.groupId,
+              existing,
+              { name: topicName(displayName, type) },
+            );
+            store.set({ ...entry, name: displayName });
+          } catch (error) {
+            if (isTopicDeletedError(error)) throw error;
+            console.warn(`[Zalo→TG] Failed to refresh topic name for ${zaloId}:`, error);
+          }
         }
         return existing;
       }
@@ -118,15 +133,17 @@ async function doCreateTopic(
   if (type === 1 && avatarUrl) {
     try {
       const localPath = await downloadToTemp(avatarUrl, `avatar_${Date.now()}.jpg`);
-      const stream = createReadStream(localPath);
-      const avatarMsg = await tg.sendPhoto(
-        config.telegram.groupId,
-        { source: stream },
-        {
-          message_thread_id: topicId,
-          caption: `🖼 Ảnh đại diện nhóm <b>${escapeHtml(displayName)}</b>`,
-          parse_mode: 'HTML',
-        },
+      const avatarMsg = await withTelegramMediaFallback(
+        forceMultipart => tg.sendPhoto(
+          config.telegram.groupId,
+          telegramMediaInput(localPath, forceMultipart),
+          {
+            message_thread_id: topicId,
+            caption: `🖼 Ảnh đại diện nhóm <b>${escapeHtml(displayName)}</b>`,
+            parse_mode: 'HTML',
+          },
+        ),
+        'Group avatar upload',
       );
       await cleanTemp(localPath);
       try {

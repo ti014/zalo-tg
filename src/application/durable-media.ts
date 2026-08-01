@@ -5,7 +5,12 @@ import type {
   MediaSpool,
 } from '../infrastructure/media/media-spool.js';
 import { config } from '../config.js';
-import { cleanTemp, downloadToTemp, materializeTempFile } from '../utils/media.js';
+import {
+  cleanTemp,
+  downloadToTemp,
+  downloadToTempFromCandidates,
+  materializeTempFile,
+} from '../utils/media.js';
 import { currentDurableZaloDeliveryId } from './durable-zalo.js';
 import { currentDurableTelegramDeliveryId } from './durable-telegram.js';
 
@@ -31,12 +36,17 @@ export function currentDurableZaloMedia(
 }
 
 export async function downloadZaloMediaDurably(
-  url: string,
+  urlOrCandidates: string | readonly string[],
   filename: string,
   ordinal = 0,
 ): Promise<string> {
   const deliveryId = currentDurableZaloDeliveryId();
-  if (!deliveryId || !runtimeMediaSpool) return downloadToTemp(url, filename);
+  const candidates = typeof urlOrCandidates === 'string'
+    ? [urlOrCandidates]
+    : [...urlOrCandidates];
+  if (!deliveryId || !runtimeMediaSpool) {
+    return downloadToTempFromCandidates(candidates, filename);
+  }
 
   const attached = runtimeMediaSpool.getForDelivery(deliveryId, ordinal);
   if (
@@ -44,12 +54,14 @@ export async function downloadZaloMediaDurably(
     && existsSync(attached.media.absolutePath)
     && runtimeMediaSpool.isReadyAndIntact(attached.media.id)
   ) {
-    return attached.media.absolutePath;
+    return config.telegram.localServer
+      ? materializeTempFile(attached.media.absolutePath, filename)
+      : attached.media.absolutePath;
   }
   if (attached) runtimeMediaSpool.detachFromDelivery(deliveryId, ordinal);
 
-  const temporaryPath = await downloadToTemp(
-    url,
+  const temporaryPath = await downloadToTempFromCandidates(
+    candidates,
     filename,
     3,
     config.media.maxObjectBytes,
@@ -59,7 +71,9 @@ export async function downloadZaloMediaDurably(
       expiresAt: Date.now() + DEFAULT_MEDIA_RETENTION_MS,
     });
     runtimeMediaSpool.attachToDelivery(deliveryId, staged.media.id, ordinal, filename);
-    return staged.media.absolutePath;
+    return config.telegram.localServer
+      ? await materializeTempFile(staged.media.absolutePath, filename)
+      : staged.media.absolutePath;
   } finally {
     await cleanTemp(temporaryPath);
   }

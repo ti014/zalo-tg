@@ -161,6 +161,10 @@ Compose healthcheck hiện dùng liveness. Container có thể vẫn là `health
 
 `restart: unless-stopped` chỉ restart khi process thoát; Docker Compose không tự restart một process vẫn còn sống nhưng healthcheck đã `unhealthy`. Nếu cần self-healing ở mức host, dùng một supervisor bên ngoài theo dõi health state và restart service có kiểm soát. Không chạy hai bridge cùng lúc trên một volume; SQLite instance lease sẽ từ chối instance thứ hai.
 
+Production Compose đặt `RESTART_ON_COMMAND=true`, nên owner có thể dùng `/restart`, xác nhận inline rồi để bridge dừng listener/worker, flush state và thoát cleanly; Docker `restart: unless-stopped` tạo process mới. Khi chạy trực tiếp bằng `npm start`, giữ `RESTART_ON_COMMAND=false` trừ khi một supervisor bên ngoài có contract restart tương đương. Nếu không có contract này, command bị khóa thay vì chỉ tắt bot.
+
+`/update` không chạy `git pull` và không sửa source. Command gọi GitHub public compare API giữa `UPSTREAM_BASE_REVISION` và `main` của `UPDATE_REPOSITORY`; production image vì vậy không cần `.git` hoặc Git binary. Khi hoàn tất một parity pass mới, chỉ cập nhật baseline sau khi behavior và regression test tương ứng đã được port. Unauthenticated API có rate limit theo source IP, nên periodic checker chỉ gọi mỗi 30 phút và failure được báo như update-check failure, không được diễn giải là đang ở bản mới nhất.
+
 ```powershell
 # Liveness
 docker compose exec -T bridge node dist/runtime/healthcheck.js
@@ -283,7 +287,7 @@ Ví dụ lựa chọn:
 
 ### 7.1. Giới hạn đang áp dụng
 
-- Telegram sang Zalo: `TG_DOWNLOAD_MAX_MB` mặc định là 20 MiB, phù hợp Telegram cloud Bot API và bị chặn cứng trên 200 MiB. Compose hiện tại chỉ có tmpfs `/tmp` 1 GiB, RAM 2 GiB và thư viện Zalo có thể nạp toàn bộ attachment vào RAM; tăng ngưỡng phải kèm load test thực tế.
+- Telegram sang Zalo: `TG_DOWNLOAD_MAX_MB` mặc định là 20 MiB. Cloud Bot API bị chặn cấu hình ở 200 MiB; local mode cho phép cấu hình tới 2048 MiB. Thư viện Zalo có thể nạp toàn bộ attachment vào RAM, nên tăng ngưỡng vẫn phải kèm disk headroom và load test thực tế.
 - Zalo sang Telegram: file, GIF, video và voice vượt `TG_UPLOAD_PART_MB` (mặc định 45 MiB) được chia lossless thành `.part001`, `.part002`, ... rồi gửi tuần tự. Nếu Telegram chỉ nhận một phần, delivery chuyển `UNKNOWN` để operator đối soát thay vì tự gửi trùng.
 - Timeout upload Telegram dùng `TG_UPLOAD_TIMEOUT_SEC` (mặc định 600 giây), tách khỏi timeout API thông thường 45 giây. Timeout không hủy chắc chắn request provider, nên kết quả vẫn đi vào `UNKNOWN`.
 - Album ở production durable mode được chuyển từng item theo FIFO thay vì gom bằng debounce trong RAM. Cách này có thể làm mất giao diện album gộp, nhưng mỗi item có delivery/idempotency state riêng và sống qua restart tốt hơn.
@@ -299,27 +303,51 @@ Zalo là dependency không chính thức trong dự án này; giới hạn uploa
 
 ### 7.2. Local Telegram Bot API
 
-`TG_API_ROOT` cho phép đổi Telegram API endpoint, nhưng repository này chưa tích hợp một local Bot API service hoàn chỉnh. Local Bot API có thể trả về `file:` URL trỏ tới absolute path bên trong container của nó; bridge hiện không share volume đó và HTTP downloader không đọc `file:` URL. Vì vậy không bật `TG_API_ROOT` chỉ để tăng giới hạn file trong cấu hình Compose hiện tại.
-
-Muốn hỗ trợ local Bot API đúng cách cần một deployment riêng có đủ `api_id`, `api_hash`, persistent volume, shared read-only file volume với bridge, path validation chống đọc file ngoài root được cấp phép và integration test cho upload/download/restore. Đây là một hạng mục mở rộng, không phải tính năng đã sẵn sàng trong stack hiện tại.
-
-Với stack đang có, giữ:
+Local Bot API là opt-in qua `compose.local-bot-api.yaml`. Lấy `api_id` và `api_hash` từ tài khoản Telegram của operator, lưu riêng trong `.env`, rồi khai báo:
 
 ```dotenv
+TG_API_ID=123456
+TG_API_HASH=replace-with-private-api-hash
+LOCAL_BOT_API=true
+TG_LOCAL_SERVER=http://telegram-bot-api:8081
+ZALO_TG_SHARED_TMP_ROOT=/var/lib/telegram-bot-api
 TG_DOWNLOAD_MAX_MB=20
 TG_UPLOAD_PART_MB=45
-TG_UPLOAD_TIMEOUT_SEC=600
-DELIVERY_SENT_RETENTION_DAYS=90
-DATA_MIN_FREE_MB=512
 ```
 
-Chunking lossless phía Zalo→Telegram đã xử lý file lớn bằng nhiều Telegram document part mà không cần local Bot API. Manifest cố định source SHA-256, byte range, filename, target topic và trạng thái từng part. Ví dụ, file 130 MiB được gửi thành ba part khoảng 45 MiB, 45 MiB và 40 MiB; người nhận ghép lại theo thứ tự `.part001`, `.part002`, `.part003`.
+`LOCAL_BOT_API` và hai path được overlay đặt lại khi chạy Compose; vẫn nên giữ chúng trong `.env` rõ ràng nếu cùng file được dùng cho local execution. Trước khi chuyển một bot đang dùng cloud API sang local server, thực hiện quy trình migration của Telegram Bot API để đóng cloud session hiện tại.
+
+Validate và khởi động:
+
+```powershell
+docker compose -f compose.yaml -f compose.local-bot-api.yaml config --quiet
+docker compose -f compose.yaml -f compose.local-bot-api.yaml up -d --build
+docker compose -f compose.yaml -f compose.local-bot-api.yaml ps
+docker compose -f compose.yaml -f compose.local-bot-api.yaml exec -T bridge node dist/runtime/healthcheck.js --readiness
+```
+
+Overlay tạo named volume `zalo-tg-telegram-local` và mount nó tại work directory chuẩn `/var/lib/telegram-bot-api` trong cả hai container. One-shot service `shared-temp-init` đặt permission cho non-root bridge. File Telegram tải xuống và media tạm bridge cần upload đều nằm dưới root này. `/app/data` không được mount sang Bot API container, nên SQLite và Zalo credentials không nằm trong shared volume. Port 8081 chỉ được expose trong Compose network, không publish ra host.
+
+Bridge chỉ chấp nhận `file:` download nằm dưới `ZALO_TG_SHARED_TMP_ROOT`; path traversal hoặc path ngoài root bị từ chối. Với upload, bridge dùng `file://` zero-copy chỉ khi source cũng nằm trong shared root. Nếu local Bot API trả HTTP 400 mô tả lỗi local file URL/path, bridge retry đúng một lần bằng multipart. HTTP 400 không liên quan file và network timeout không kích hoạt fallback, tránh che lỗi logic hoặc tạo duplicate sau outcome mơ hồ.
+
+Muốn thử file lớn hơn cloud limit, tăng đồng thời các quota liên quan và giữ tổng spool lớn hơn object quota. Ví dụ cấu hình 500 MiB:
+
+```dotenv
+TG_DOWNLOAD_MAX_MB=500
+TG_UPLOAD_PART_MB=500
+MEDIA_MAX_OBJECT_MB=500
+MEDIA_SPOOL_MAX_MB=5120
+```
+
+Không đặt 2048 MiB chỉ vì parser cho phép. Trước hết kiểm tra free disk của cả `zalo-tg-data` và `zalo-tg-telegram-local`, RAM peak của `zca-js`, upload timeout và behavior thực tế của Zalo. Chunking lossless phía Zalo→Telegram vẫn hoạt động khi giữ `TG_UPLOAD_PART_MB=45`; manifest cố định SHA-256, byte range, filename, target topic và trạng thái từng part.
+
+Để quay lại cloud API, chạy lại base Compose không kèm overlay và force-recreate `bridge`. Không xóa local Bot API volume cho tới khi xác nhận không còn file/cached session cần giữ.
 
 ### 7.3. Độ bền media hiện tại
 
 SQLite lưu event trước khi chuyển tiếp. Ở cả hai chiều, sau lần download thành công đầu tiên, media được hash, atomic rename vào `/app/data/media` và gắn với delivery; retry đọc lại blob local sau khi kiểm tra size và SHA-256, không cần gọi lại URL provider. File transcode và binary part chỉ nằm ở `/tmp`, nhưng source cùng multipart manifest/receipt bền vững cho phép tái tạo đúng các part còn `PENDING`. Khi delivery `SENT`, `SKIPPED` hoặc `DLQ`, reference được tháo và object chỉ bị cleanup sau retention period. `PERMANENT_FAILED` giữ media vì operator vẫn có thể requeue. Tombstone chưa xóa được khỏi filesystem vẫn được tính vào quota để tránh báo dư dung lượng giả.
 
-Khoảng chưa thể loại bỏ hoàn toàn là crash trong lúc download đầu tiên, trước khi object được stage; lần retry vẫn phải tải lại URL Zalo hoặc Telegram. Binary Telegram chưa được tải ngay trong capture transaction vì download dài sẽ giữ polling update quá lâu; staging diễn ra ở delivery attempt đầu tiên. Với file vượt giới hạn cloud Bot API, cần thiết kế local Bot API deployment như phần 7.2 trước khi tăng ngưỡng.
+Khoảng chưa thể loại bỏ hoàn toàn là crash trong lúc download đầu tiên, trước khi object được stage; lần retry vẫn phải tải lại URL Zalo hoặc Telegram. Binary Telegram chưa được tải ngay trong capture transaction vì download dài sẽ giữ polling update quá lâu; staging diễn ra ở delivery attempt đầu tiên. Với file vượt giới hạn cloud Bot API, bật và kiểm tra local Bot API deployment như phần 7.2 trước khi tăng ngưỡng.
 
 Theo dõi dung lượng:
 
@@ -475,6 +503,7 @@ Các giới hạn sau đã được giữ minh bạch thay vì mô tả hệ th�
 - Bảng `conversation_policies` đã có trong schema để mở rộng, nhưng runtime hiện dùng hai global flag `ZALO_SKIP_MUTED_GROUPS` và `ZALO_SKIP_STRANGER_MESSAGES`; chưa có command quản trị per-conversation hoặc quarantine workflow.
 - Telegram→Zalo stage binary vào persistent spool ở delivery attempt đầu tiên, không phải ngay trong capture transaction. Nếu provider file biến mất trước lần stage đầu tiên thì delivery không thể tự phục hồi.
 - Durable album được ưu tiên theo từng item FIFO, nên giao diện album gộp không được bảo toàn.
-- Local Telegram Bot API chưa nằm trong Compose stack hiện tại; xem phần 7.2.
+- Local Telegram Bot API có unit/config proof nhưng vẫn cần smoke test thật với `TG_API_ID`, `TG_API_HASH`, bot session và file lớn trước production acceptance; CI không sở hữu các secret/provider session đó.
+- Upstream Go TUI và shell installer không được đưa vào runtime này. Chúng kéo thêm toolchain/binary và mutable checkout flow không phù hợp container read-only, durable SQLite recovery và PowerShell runbook đang là deployment authority.
 
 Ví dụ: nếu một split file báo `Telegram accepted 2/3 part(s)` và part 3 là `UNKNOWN`, không chạy `/queue retry` ngay. Kiểm tra topic đích, dùng `/queue part sent ... 3 <message-id>` nếu part 3 đã xuất hiện, hoặc `/queue part retry ... 3` nếu chắc chắn chưa xuất hiện. Sau đó `/queue retry` chỉ upload các part còn `PENDING`; hai part đã có receipt không bị gửi lại.

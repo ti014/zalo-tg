@@ -16,6 +16,8 @@ Bridge chạy như một process Node.js lâu dài. SQLite và Docker named volu
 - At-least-once delivery, retry, lease, provider receipt và kết quả `UNKNOWN` để operator xử lý.
 - Media spool bền vững, giới hạn kích thước, dọn object hết hạn và multipart Telegram upload.
 - Đăng nhập Zalo bằng QR qua Telegram.
+- Đăng nhập QR qua Web hoặc PC-App, xem đầy đủ group/member, backfill history, offline auto-reply và quản lý friend request.
+- Tùy chọn local Telegram Bot API với shared volume giới hạn theo path và multipart fallback an toàn.
 - Deployment preflight, SQLite instance lease, liveness và readiness check.
 - Docker runtime được harden: non-root user, read-only root filesystem, bỏ capability, giới hạn tài nguyên và external named volume.
 
@@ -116,6 +118,15 @@ Service không publish host port vì dùng Telegram long polling. Data được 
 npm run docker:seed
 ~~~
 
+Để bật local Telegram Bot API, khai báo `TG_API_ID`, `TG_API_HASH` rồi dùng overlay được duy trì cùng repository:
+
+~~~powershell
+docker compose -f compose.yaml -f compose.local-bot-api.yaml config --quiet
+docker compose -f compose.yaml -f compose.local-bot-api.yaml up -d --build
+~~~
+
+Overlay không publish port 8081. Hai container chỉ dùng chung một volume media riêng tại cùng absolute path; Zalo credentials và SQLite data không được mount sang Bot API service.
+
 ### 5. Xác minh deployment
 
 ~~~powershell
@@ -190,8 +201,8 @@ Copy `.env.example` thành `.env`. ID, boolean, số hoặc production path khô
 
 | Variable | Mặc định | Giới hạn hoặc tác dụng |
 | --- | ---: | --- |
-| `TG_DOWNLOAD_MAX_MB` | 20 | Tối đa 200 MB |
-| `TG_UPLOAD_PART_MB` | 45 | Tối đa 200 MB |
+| `TG_DOWNLOAD_MAX_MB` | 20 | Tối đa 200 MB với cloud API; 2048 MB trong local mode |
+| `TG_UPLOAD_PART_MB` | 45 | Tối đa 200 MB với cloud API; 2048 MB trong local mode |
 | `TG_UPLOAD_TIMEOUT_SEC` | 600 | Tối đa 3600 giây |
 | `MEDIA_MAX_OBJECT_MB` | 200 | Tối đa 2048 MB |
 | `MEDIA_SPOOL_MAX_MB` | 5120 | Tối đa 102400 MB |
@@ -200,8 +211,14 @@ Copy `.env.example` thành `.env`. ID, boolean, số hoặc production path khô
 | `ZALO_SKIP_MUTED_GROUPS` | false | Bỏ qua message từ muted group |
 | `ZALO_SKIP_STRANGER_MESSAGES` | false | Bỏ qua DM từ người không phải friend |
 | `UPDATE_CHECK_ENABLED` | false trong production | Bật update notification |
+| `UPDATE_REPOSITORY` | `williamcachamwri/zalo-tg` | Public GitHub upstream được check read-only |
+| `UPSTREAM_BASE_REVISION` | `155b6cc` | Upstream commit cuối đã audit vào fork |
 | `ALLOW_SECRET_BACKUP` | false | Cho phép backup chứa secret |
+| `RESTART_ON_COMMAND` | false; production Compose đặt true | Chỉ cho `/restart` khi có process supervisor |
 | `TG_API_ROOT` | unset | Bot API root tùy chọn; đọc `docs/operations.md` trước |
+| `LOCAL_BOT_API` | false | Bật local Bot API file semantics |
+| `TG_LOCAL_SERVER` | unset | Local Bot API URL, thường là `http://telegram-bot-api:8081` |
+| `ZALO_TG_SHARED_TMP_ROOT` | OS temp | Absolute path dùng chung với local Bot API service; overlay dùng `/var/lib/telegram-bot-api` |
 
 Boolean nhận `1/true/yes/on` và `0/false/no/off`.
 
@@ -210,15 +227,19 @@ Boolean nhận `1/true/yes/on` và `0/false/no/off`.
 | Command | Mục đích |
 | --- | --- |
 | `/login` | Đăng nhập Zalo bằng QR |
+| `/loginweb`, `/loginapp` | Chọn Web hoặc PC-App login; App mode refresh hidden-member data |
 | `/status` | Xem bridge và provider status |
 | `/topic list\|info\|delete` | Xem hoặc bỏ topic mapping |
 | `/search <query>` | Tìm friend và tạo direct-message topic |
 | `/addfriend`, `/friendrequests` | Quản lý friend request Zalo |
 | `/addgroup`, `/joingroup`, `/leavegroup` | Quản lý nhóm Zalo |
+| `/group_info`, `/group_infoall`, `/history` | Xem group và replay history gần đây qua durable relay |
+| `/autoreply` | Cấu hình delayed DM auto-reply với durable cooldown reservation |
 | `/recall` | Recall message Zalo do bot gửi |
 | `/queue` | Xem queue, retry và delivery `UNKNOWN` |
 | `/backup`, `/restore` | Backup/restore application có kiểm soát |
 | `/settings`, `/members`, `/kick`, `/clear` | Thao tác quản trị |
+| `/seed`, `/admin`, `/update`, `/restart` | Operator diagnostic, update check và supervised restart |
 | `/help`, `/menu` | Xem command catalog hiện tại |
 
 Hành động có quyền cao bị giới hạn bởi `TG_OWNER_IDS`. Giữ group private vì member thường vẫn relay được message.
@@ -335,7 +356,7 @@ src/
 ├── tools/                           Docker seed/verify và TGS conversion
 └── utils/                           format, download, media, Telegram queue
 tests/                               TypeScript test chạy bằng Node
-compose*.yaml                        production, development và seed overlay
+compose*.yaml                        production, development, seed và local Bot API overlay
 Dockerfile                           multi-stage production image
 docs/operations.md                   production runbook
 scripts/                             PowerShell backup và restore

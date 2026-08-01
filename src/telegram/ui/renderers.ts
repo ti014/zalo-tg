@@ -87,6 +87,7 @@ export function renderHelp(): string {
     `/topic list - danh sách ánh xạ\n` +
     `/topic delete - xóa ánh xạ topic hiện tại\n` +
     `/clear - xóa mapping cũ an toàn rồi tự restart bridge, có xác nhận\n` +
+    `/restart - graceful restart khi runtime có process supervisor\n` +
     `/addfriend &lt;số điện thoại&gt; - tìm và kết bạn\n` +
     `/friendrequests - xem lời mời\n` +
     `/recall - thu hồi tin nhắn đã gửi sang Zalo\n` +

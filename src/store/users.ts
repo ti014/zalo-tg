@@ -2,9 +2,15 @@ const USER_CACHE_MAX = 500;
 const _uidToName       = new Map<string, string>();
 const _normToUid       = new Map<string, string>();
 const _groupNameToUid  = new Map<string, Map<string, string>>();
+const _groupUidToName  = new Map<string, Map<string, string>>();
 
 function _normName(name: string): string {
-  return name.toLowerCase().trim().replace(/\s+/g, ' ');
+  return name.toLowerCase()
+    .normalize('NFD')
+    .replace(/\p{Mn}/gu, '')
+    .replace(/đ/g, 'd')
+    .trim()
+    .replace(/\s+/g, ' ');
 }
 
 function removeUidFromGroupMaps(uid: string): void {
@@ -13,6 +19,7 @@ function removeUidFromGroupMaps(uid: string): void {
       if (mappedUid === uid) groupMap.delete(name);
     }
   }
+  for (const uidMap of _groupUidToName.values()) uidMap.delete(uid);
 }
 
 export const userCache = {
@@ -26,18 +33,34 @@ export const userCache = {
         removeUidFromGroupMaps(firstUid);
       }
     }
+    const previousName = _uidToName.get(uid);
+    if (previousName && previousName !== displayName) {
+      const previousKey = _normName(previousName);
+      if (_normToUid.get(previousKey) === uid) _normToUid.delete(previousKey);
+    }
     _uidToName.set(uid, displayName);
     _normToUid.set(_normName(displayName), uid);
   },
 
   saveForGroup(uid: string, displayName: string, zaloId: string): void {
-    this.save(uid, displayName);
+    if (!_uidToName.has(uid)) this.save(uid, displayName);
     let groupMap = _groupNameToUid.get(zaloId);
     if (!groupMap) {
       groupMap = new Map<string, string>();
       _groupNameToUid.set(zaloId, groupMap);
     }
+    const previousGroupName = _groupUidToName.get(zaloId)?.get(uid);
+    if (previousGroupName && previousGroupName !== displayName) {
+      const previousKey = _normName(previousGroupName);
+      if (groupMap.get(previousKey) === uid) groupMap.delete(previousKey);
+    }
     groupMap.set(_normName(displayName), uid);
+    let uidMap = _groupUidToName.get(zaloId);
+    if (!uidMap) {
+      uidMap = new Map<string, string>();
+      _groupUidToName.set(zaloId, uidMap);
+    }
+    uidMap.set(uid, displayName);
   },
 
   resolveByName(rawName: string): string | undefined {
@@ -51,6 +74,18 @@ export const userCache = {
 
   getName(uid: string): string | undefined {
     return _uidToName.get(uid);
+  },
+
+  getNameInGroup(uid: string, zaloId: string): string | undefined {
+    return _groupUidToName.get(zaloId)?.get(uid);
+  },
+
+  stats(): { users: number; groups: number; maxUsers: number } {
+    return {
+      users: _uidToName.size,
+      groups: _groupNameToUid.size,
+      maxUsers: USER_CACHE_MAX,
+    };
   },
 };
 
@@ -94,6 +129,14 @@ export const friendsCache = {
   has(userId: string): boolean {
     return _friends.some(friend => friend.userId === userId);
   },
+
+  get(userId: string): ZaloFriend | undefined {
+    return _friends.find(friend => friend.userId === userId);
+  },
+
+  stats(): { count: number } {
+    return { count: _friends.length };
+  },
 };
 
 export interface ZaloGroup {
@@ -124,5 +167,9 @@ export const groupsCache = {
 
   isFresh(): boolean {
     return _groups.length > 0 && Date.now() - _groupsTs < GROUPS_TTL_MS;
+  },
+
+  stats(): { count: number } {
+    return { count: _groups.length };
   },
 };

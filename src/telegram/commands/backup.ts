@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import type { Context } from 'telegraf';
@@ -13,6 +13,7 @@ import {
   type TopicEntry,
 } from '../../store/index.js';
 import { writeJsonAtomicSync } from '../../infrastructure/files/atomic-file.js';
+import { telegramDocumentInput, withTelegramMediaFallback } from '../media-input.js';
 
 const PROJECT_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const MSG_MAP_PATH = path.resolve(config.dataDir, 'msg-map.json');
@@ -194,13 +195,16 @@ async function sendBackupDocument(
   const filePath = backupFilePath(kind);
   writeJsonAtomicSync(filePath, backup, 2);
   try {
-    await ctx.telegram.sendDocument(
-      config.telegram.groupId,
-      { source: createReadStream(filePath), filename: path.basename(filePath) },
-      {
-        ...(threadId ? { message_thread_id: threadId } : {}),
-        caption,
-      },
+    await withTelegramMediaFallback(
+      forceMultipart => ctx.telegram.sendDocument(
+        config.telegram.groupId,
+        telegramDocumentInput(filePath, path.basename(filePath), forceMultipart),
+        {
+          ...(threadId ? { message_thread_id: threadId } : {}),
+          caption,
+        },
+      ),
+      'Backup document upload',
     );
   } finally {
     try { unlinkSync(filePath); } catch { /* best effort */ }

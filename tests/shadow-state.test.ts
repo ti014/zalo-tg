@@ -104,6 +104,7 @@ test('sent shadow updates replace stale aliases and retain provider alias kinds'
     shadowSentMessage(20, {
       msgId: 'final-msg',
       cliMsgId: 'final-cli',
+      msgIds: ['final-msg', 'attachment-msg'],
       zaloId: 'user-b',
       threadType: 0,
     });
@@ -115,12 +116,14 @@ test('sent shadow updates replace stale aliases and retain provider alias kinds'
     `).all(), [
       { alias: 'final-cli', alias_kind: 'cli_msg_id' },
       { alias: 'final-msg', alias_kind: 'msg_id' },
+      { alias: 'attachment-msg', alias_kind: 'provider_alias' },
     ]);
     assert.equal(lookupShadowSentTelegramIdByAlias('provisional-msg'), undefined);
     assert.equal(lookupShadowSentTelegramIdByAlias('final-msg'), 20);
     assert.deepEqual(lookupShadowSentInfo(20), {
       msgId: 'final-msg',
       cliMsgId: 'final-cli',
+      msgIds: ['final-msg', 'attachment-msg'],
       zaloId: 'user-b',
       threadType: 0,
     });

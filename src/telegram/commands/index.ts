@@ -16,6 +16,13 @@ import { registerBackupCommands } from './backup.js';
 import { registerKickCommand, registerMembersCommand } from './members.js';
 import { registerQueueCommand } from './queue.js';
 import { registerClearCommand } from './clear.js';
+import { registerAutoReplyCommand } from './autoreply.js';
+import { registerGroupInfoCommands } from './group-info.js';
+import { registerHistoryCommand } from './history.js';
+import { registerSeedCommand } from './seed.js';
+import { registerAdminCommand } from './admin.js';
+import { registerUpdateCommand } from './update.js';
+import { registerRestartCommand } from './restart.js';
 
 export function registerAllCommands(ctx: TgHandlerContext): void {
   registerMenuCommand(ctx);
@@ -36,4 +43,11 @@ export function registerAllCommands(ctx: TgHandlerContext): void {
   registerKickCommand(ctx);
   registerQueueCommand(ctx);
   registerClearCommand(ctx);
+  registerAutoReplyCommand(ctx);
+  registerGroupInfoCommands(ctx);
+  registerHistoryCommand(ctx);
+  registerSeedCommand(ctx);
+  registerAdminCommand(ctx);
+  registerUpdateCommand(ctx);
+  registerRestartCommand(ctx);
 }

@@ -1,20 +1,13 @@
 import { Zalo, LoginQRCallbackEventType } from 'zca-js';
 import type { LoginQRCallback } from 'zca-js';
-import { existsSync, mkdirSync, readFileSync, statSync } from 'fs';
-import os from 'os';
-import path from 'path';
+import { existsSync, readFileSync, statSync } from 'fs';
 import { imageSizeFromFile } from 'image-size/fromFile';
 import qrcode from 'qrcode-terminal';
 import { config } from '../config.js';
 import type { ZaloAPI } from './types.js';
 import { writeJsonAtomicSync } from '../infrastructure/files/atomic-file.js';
 import { clearZaloPolicyCaches } from './conversation-policy.js';
-
-// Use os.tmpdir() so it works on Windows (e.g. C:\Users\...\AppData\Local\Temp)
-// as well as macOS/Linux (/tmp or /var/folders/...).
-const QR_TMP_DIR = path.join(os.tmpdir(), 'zalo-tg');
-mkdirSync(QR_TMP_DIR, { recursive: true });
-const QR_IMAGE_PATH = path.join(QR_TMP_DIR, 'zalo-qr.png');
+import { createSharedTempPath, prepareSharedTempFile } from '../utils/sharedTemp.js';
 
 let _api: ZaloAPI | null = null;
 let _apiPromise: Promise<ZaloAPI> | null = null;
@@ -76,6 +69,7 @@ async function runQRLogin(
   zalo: InstanceType<typeof Zalo>,
   hooks: QRLoginHooks = {},
 ): Promise<ZaloAPI> {
+  const qrImagePath = createSharedTempPath('zalo-tg', 'zalo-qr', 'png');
   const callback: LoginQRCallback = (event) => {
     switch (event.type) {
 
@@ -83,8 +77,9 @@ async function runQRLogin(
         const { code } = event.data;
 
         // Save QR image first, then notify hooks
-        const savePromise = (event.actions.saveToFile(QR_IMAGE_PATH) as Promise<unknown>)
+        const savePromise = (event.actions.saveToFile(qrImagePath) as Promise<unknown>)
           .then(async () => {
+            prepareSharedTempFile(qrImagePath);
             // Print to terminal
             await new Promise<void>((res) => {
               qrcode.generate(code, { small: true }, (qrStr) => {
@@ -93,12 +88,12 @@ async function runQRLogin(
                 console.log('│      Quét QR bằng ứng dụng Zalo         │');
                 console.log('└─────────────────────────────────────────┘\n');
                 console.log(qrStr);
-                console.log(`(Ảnh QR: ${QR_IMAGE_PATH})\n`);
+                console.log(`(Ảnh QR: ${qrImagePath})\n`);
                 res();
               });
             });
             // Notify external hook (e.g. send to Telegram)
-            await hooks.onQRReady?.(QR_IMAGE_PATH, code);
+            await hooks.onQRReady?.(qrImagePath, code);
           })
           .catch((err: unknown) => console.error('[Zalo] QR hook error:', err));
 
@@ -135,7 +130,7 @@ async function runQRLogin(
     }
   };
 
-  const api = await zalo.loginQR({ qrPath: QR_IMAGE_PATH }, callback);
+  const api = await zalo.loginQR({ qrPath: qrImagePath }, callback);
   if (!api) throw new Error('[Zalo] QR login failed – no API returned.');
   console.log('\n[Zalo] Đăng nhập thành công ✓');
   return api as ZaloAPI;

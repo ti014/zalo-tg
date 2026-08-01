@@ -1,11 +1,12 @@
 import type { PollOptions } from 'zca-js';
 import type { ZaloAPI, ZaloMediaContent, ZaloGroupInfoResponse } from './types.js';
 import { isZaloRateLimitError, runZaloRequest } from './rate-limit.js';
-import { userCache } from '../store/index.js';
+import { aliasCache, friendsCache, userCache } from '../store/index.js';
 import { tgBot } from '../telegram/bot.js';
 import { escapeHtml } from '../utils/format.js';
 import { tgQueue } from '../utils/tgQueue.js';
 import { config } from '../config.js';
+import { appGetGroupInfo, appGetGroupMembersInfo, type AppGroupData } from './app-api.js';
 
 const TELEGRAM_UPLOAD_METHODS = new Set([
   'sendAnimation',
@@ -61,37 +62,83 @@ export function parseBankCardHtml(html: string): BankCardInfo | null {
   return { bankName, accountNumber, holderName, vietqr };
 }
 
+export interface GroupMemberListSummary {
+  memberIds: string[];
+  totalMember: number;
+  incomplete: boolean;
+}
+
+export function summarizeGroupMemberList(
+  groupData: Pick<AppGroupData, 'memVerList' | 'currentMems' | 'totalMember' | 'hasMoreMember'>,
+): GroupMemberListSummary {
+  const memberIds = Array.from(new Set([
+    ...(groupData.memVerList ?? []).map(value => String(value).split('_')[0]),
+    ...(groupData.currentMems ?? []).map(member => String(member.id).split('_')[0]),
+  ].filter((uid): uid is string => Boolean(uid))));
+  const totalMember = Number(groupData.totalMember) || memberIds.length;
+  return {
+    memberIds,
+    totalMember,
+    incomplete: Number(groupData.hasMoreMember) > 0 || memberIds.length < totalMember,
+  };
+}
+
 export async function populateGroupMemberCache(api: ZaloAPI, groupId: string): Promise<boolean> {
   try {
-    const info = await runZaloRequest(
-      { label: `getGroupInfo(${groupId})`, priority: 'low', maxRetries: 0 },
-      () => api.getGroupInfo(groupId),
-    ) as {
-      gridInfoMap?: Record<string, {
-        memVerList?: string[];
-        totalMember?: number;
-      }>;
-    };
-    const groupData = info?.gridInfoMap?.[groupId];
+    let groupData = await appGetGroupInfo(groupId);
+    let source: 'app' | 'web' = 'app';
     if (!groupData) {
-      console.warn(`[Zalo] getGroupInfo: no data for group ${groupId}`);
+      source = 'web';
+      const info = await runZaloRequest(
+        { label: 'getGroupInfo(' + groupId + ')', priority: 'low', maxRetries: 0 },
+        () => api.getGroupInfo(groupId),
+      ) as { gridInfoMap?: Record<string, AppGroupData> };
+      groupData = info?.gridInfoMap?.[groupId] ?? null;
+    }
+    if (!groupData) {
+      console.warn('[Zalo] getGroupInfo: no data for group ' + groupId);
       return false;
     }
 
-    const uids = (groupData.memVerList ?? [])
-      .map(s => s.split('_')[0])
-      .filter(Boolean);
-    if (uids.length === 0) {
-      console.warn(`[Zalo] group ${groupId}: empty memVerList (totalMember=${groupData.totalMember})`);
+    const summary = summarizeGroupMemberList(groupData);
+    const knownNames = new Map<string, string>();
+    for (const member of groupData.currentMems ?? []) {
+      const uid = String(member.id).split('_')[0] ?? '';
+      const name = member.dName?.trim() || member.zaloName?.trim();
+      if (uid && name) knownNames.set(uid, name);
+    }
+
+    if (summary.memberIds.length === 0) {
+      console.warn(
+        '[Zalo] group ' + groupId + ': empty member list (totalMember='
+        + summary.totalMember + ')',
+      );
+      if (summary.incomplete) {
+        console.warn(
+          '[Zalo] group ' + groupId + ': member list is hidden/incomplete; '
+          + 'run /loginapp to refresh through PC App API.',
+        );
+      }
       return true;
     }
 
+    if (source === 'app') {
+      const appNames = await appGetGroupMembersInfo(summary.memberIds);
+      for (const [uid, name] of appNames ?? []) knownNames.set(uid, name);
+    }
+    for (const [uid, name] of knownNames) userCache.saveForGroup(uid, name, groupId);
+
+    const unresolved = summary.memberIds.filter(uid => !knownNames.has(uid));
     const batchSize = 20;
-    let saved = 0;
-    for (let i = 0; i < uids.length; i += batchSize) {
-      const batch = uids.slice(i, i + batchSize);
+    let saved = knownNames.size;
+    for (let i = 0; i < unresolved.length; i += batchSize) {
+      const batch = unresolved.slice(i, i + batchSize);
       const resp = await runZaloRequest(
-        { label: `getUserInfo(${groupId}:${i}-${i + batch.length})`, priority: 'low', maxRetries: 0 },
+        {
+          label: 'getUserInfo(' + groupId + ':' + i + '-' + (i + batch.length) + ')',
+          priority: 'low',
+          maxRetries: 0,
+        },
         () => api.getUserInfo(batch),
       ) as {
         changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
@@ -100,12 +147,28 @@ export async function populateGroupMemberCache(api: ZaloAPI, groupId: string): P
       const profiles = resp?.changed_profiles ?? {};
       const unchanged = resp?.unchanged_profiles ?? {};
       for (const uid of batch) {
-        const p = (profiles[uid] ?? unchanged[uid]) as { displayName?: string; zaloName?: string } | undefined;
+        const versionedUid = uid.includes('_') ? uid : uid + '_0';
+        const p = (
+          profiles[uid]
+          ?? profiles[versionedUid]
+          ?? unchanged[uid]
+          ?? unchanged[versionedUid]
+        ) as { displayName?: string; zaloName?: string } | undefined;
         const name = p?.displayName?.trim() || p?.zaloName?.trim();
         if (uid && name) { userCache.saveForGroup(uid, name, groupId); saved++; }
       }
     }
-    console.log(`[Zalo] Cached ${saved}/${uids.length} members for group ${groupId}`);
+    if (summary.incomplete) {
+      console.warn(
+        '[Zalo] group ' + groupId + ': ' + source + ' API returned only '
+        + summary.memberIds.length + '/' + summary.totalMember + ' member IDs.',
+      );
+    }
+    console.log(
+      '[Zalo] Cached ' + saved + '/' + summary.memberIds.length
+      + ' visible members for group ' + groupId + ' via ' + source + ' API',
+    );
+    memberCacheLoaded.add(groupId);
     clearMemberCacheRetry(groupId);
     return true;
   } catch (err) {
@@ -127,6 +190,10 @@ export function getCachedGroupInfo(zaloId: string): { name?: string; avt?: strin
   const hit = _groupInfoCache.get(zaloId);
   if (!hit || Date.now() - hit.ts >= GROUP_INFO_TTL) return undefined;
   return hit;
+}
+
+export function invalidateCachedGroupInfo(zaloId: string): void {
+  _groupInfoCache.delete(zaloId);
 }
 
 export async function refreshCachedGroupInfo(
@@ -157,9 +224,25 @@ export function getCachedUserDisplayName(uid: string | undefined, fallback = 'ai
   return userCache.getName(cleanUid)?.trim() || fallback.trim() || cleanUid;
 }
 
-export async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefined, fallback = 'ai đó'): Promise<string> {
+export async function resolveUserDisplayName(
+  api: ZaloAPI,
+  uid: string | undefined,
+  fallback = 'ai đó',
+  groupId?: string,
+): Promise<string> {
   const cleanUid = uid?.trim();
   if (!cleanUid) return fallback;
+
+  const friend = friendsCache.get(cleanUid);
+  const contactName = friend?.alias?.trim()
+    || aliasCache.get(cleanUid)?.trim()
+    || friend?.displayName?.trim();
+  if (contactName) return contactName;
+
+  if (groupId) {
+    const groupName = userCache.getNameInGroup(cleanUid, groupId)?.trim();
+    if (groupName) return groupName;
+  }
 
   const cached = userCache.getName(cleanUid);
   if (cached?.trim()) return cached;
@@ -178,7 +261,13 @@ export async function resolveUserDisplayName(api: ZaloAPI, uid: string | undefin
       changed_profiles?: Record<string, { displayName?: string; zaloName?: string }>;
       unchanged_profiles?: Record<string, unknown>;
     };
-    const profile = (resp?.changed_profiles?.[cleanUid] ?? resp?.unchanged_profiles?.[cleanUid]) as
+    const versionedUid = cleanUid.includes('_') ? cleanUid : cleanUid + '_0';
+    const profile = (
+      resp?.changed_profiles?.[versionedUid]
+      ?? resp?.changed_profiles?.[cleanUid]
+      ?? resp?.unchanged_profiles?.[versionedUid]
+      ?? resp?.unchanged_profiles?.[cleanUid]
+    ) as
       | { displayName?: string; zaloName?: string }
       | undefined;
     const name = profile?.displayName?.trim() || profile?.zaloName?.trim();
@@ -227,6 +316,23 @@ export function buildScoreText(header: string, options: Pick<PollOptions, 'conte
 }
 
 export const memberCacheLoaded = new Set<string>();
+
+export function resetMemberCacheLoaded(): void {
+  memberCacheLoaded.clear();
+}
+
+export async function ensureGroupMemberCache(api: ZaloAPI, groupId: string): Promise<boolean> {
+  if (memberCacheLoaded.has(groupId)) return true;
+  memberCacheLoaded.add(groupId);
+  const loaded = await populateGroupMemberCache(api, groupId);
+  if (!loaded) memberCacheLoaded.delete(groupId);
+  return loaded;
+}
+
+export async function refreshGroupMemberCache(api: ZaloAPI, groupId: string): Promise<boolean> {
+  memberCacheLoaded.delete(groupId);
+  return ensureGroupMemberCache(api, groupId);
+}
 
 const MEMBER_CACHE_RETRY_COOLDOWN_MS = 10 * 60 * 1000;
 const memberCacheRetryAfter = new Map<string, number>();

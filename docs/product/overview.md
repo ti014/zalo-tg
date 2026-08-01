@@ -14,12 +14,21 @@ conversations from Telegram while preserving their context.
   Topics.
 - Synchronize replies, mentions, reactions, recalls, contacts, locations,
   polls, and selected Zalo group events where the provider APIs support them.
+- Resolve contact aliases before provider display names, keep names scoped per
+  group, synchronize group renames, and preserve rich-text object messages.
 - Preserve Telegram media quality by keeping static stickers as WebP, keeping
   valid GIFs unchanged, and sending MP4 animations/video stickers through
   Zalo's video path when supported. TGS and definitive provider fallbacks use
   a size-aware, palette-optimized GIF quality ladder.
+- Prefer Zalo photo variants in HD, normal, thumbnail order; preserve Unicode
+  filenames; render animated Zalo sticker sprite sheets as GIF; and fall back
+  from Telegram animation to video and document only after definitive rejects.
 - Authenticate the Zalo account using a QR code initiated by the Telegram
-  `/login` command.
+  `/login`, `/loginweb`, or `/loginapp` command. PC-App login can recover full
+  member data hidden from the Web API.
+- Support group history backfill, opt-in delayed DM auto-reply with durable
+  cooldown reservations, friend-request pagination, group join review, group
+  information, seed inspection, and owner diagnostics.
 - Persist mappings, delivery attempts, receipts, media metadata, and
   compatibility state in SQLite.
 - Preserve FIFO delivery order within an individual conversation and expose
@@ -43,6 +52,8 @@ in [the runbook](../operations.md).
 
 Media fallback must not run after an ambiguous provider outcome: the delivery
 remains `UNKNOWN` so an operator can reconcile it without creating a duplicate.
+Local Bot API file-URI retries are further limited to definitive HTTP 400
+errors that identify the local file path or URL.
 
 ## Access and operational boundaries
 
@@ -53,6 +64,12 @@ remains `UNKNOWN` so an operator can reconcile it without creating a duplicate.
   remain private and limited to trusted people.
 - The bridge is a single-instance deployment. Two instances must not share one
   SQLite data volume.
+- `/restart` is available only when the runtime explicitly declares a process
+  supervisor. Production Compose enables it and performs graceful shutdown
+  before Docker starts the replacement process.
+- Local Telegram Bot API mode is opt-in. It uses a dedicated shared media
+  volume and never mounts the SQLite/Zalo credential volume into the Bot API
+  container.
 - Zalo and Telegram API availability, message-type support, and provider-side
   limits constrain what can be synchronized.
 

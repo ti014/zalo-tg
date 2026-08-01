@@ -8,7 +8,7 @@ import {
   mkdtempSync,
   rmSync,
 } from 'fs';
-import { chmod, copyFile, readFile, stat, unlink } from 'fs/promises';
+import { chmod, copyFile, readFile, realpath, stat, unlink } from 'fs/promises';
 import { spawn } from 'child_process';
 import { createRequire } from 'module';
 import { promisify } from 'node:util';
@@ -16,8 +16,14 @@ import { gunzip } from 'node:zlib';
 import { pipeline, Transform } from 'node:stream';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'node:url';
+import { imageSizeFromFile } from 'image-size/fromFile';
+import { config } from '../config.js';
+import { getSharedTempDir, getSharedTempRoot } from './sharedTemp.js';
 
-const TMP_DIR = path.join(os.tmpdir(), 'zalo-tg');
+const TMP_DIR = config.telegram.localServer
+  ? getSharedTempDir('zalo-tg')
+  : path.join(os.tmpdir(), 'zalo-tg');
 const require = createRequire(import.meta.url);
 const pipelineAsync = promisify(pipeline);
 
@@ -54,13 +60,25 @@ const ULTRA_GIF_PRESET: GifPreset = { fps: 1, width: 64, colors: 8 };
 
 let tgsConversionQueue: Promise<void> = Promise.resolve();
 
-function sanitizeTempFileName(fileName: string): string {
-  const sanitized = (fileName.trim() || 'media.bin')
-    .replace(/[^a-zA-Z0-9._-]/g, '_');
-  if (sanitized.length <= 128) return sanitized;
+/** Preserve readable Unicode while removing path, control, and bidi characters. */
+export function sanitizeFileName(fileName: string, fallback = 'media.bin'): string {
+  let sanitized = fileName
+    .normalize('NFC')
+    .replace(/[\\/:*?"<>|\u0000-\u001F\u007F-\u009F]/gu, '_')
+    .replace(/[\u202A-\u202E\u2066-\u2069]/gu, '_')
+    .trim()
+    .replace(/[. ]+$/gu, '');
+  if (!sanitized || sanitized === '.' || sanitized === '..') sanitized = fallback;
+  if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/iu.test(sanitized)) {
+    sanitized = `_${sanitized}`;
+  }
+
+  const maxCodePoints = 180;
+  if (Array.from(sanitized).length <= maxCodePoints) return sanitized;
   const extension = path.extname(sanitized).slice(0, 32);
-  const stemLength = Math.max(1, 128 - extension.length);
-  return `${sanitized.slice(0, sanitized.length - path.extname(sanitized).length).slice(0, stemLength)}${extension}`;
+  const extensionLength = Array.from(extension).length;
+  const stem = sanitized.slice(0, sanitized.length - path.extname(sanitized).length);
+  return `${Array.from(stem).slice(0, Math.max(1, maxCodePoints - extensionLength)).join('')}${extension}`;
 }
 
 function runTgsConversionExclusive<T>(task: () => Promise<T>): Promise<T> {
@@ -282,7 +300,7 @@ export async function downloadToTemp(
   // Sanitize filename and add a unique prefix so concurrent downloads
   // with the same logical name (e.g. multiple 'photo.jpg' in a media group)
   // do not overwrite each other.
-  const baseName = sanitizeTempFileName(fileName ?? `download_${Date.now()}`);
+  const baseName = sanitizeFileName(fileName ?? `download_${Date.now()}`);
 
   let lastErr: unknown;
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -293,6 +311,26 @@ export async function downloadToTemp(
 
     const filePath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
     try {
+      if (url.startsWith('file:')) {
+        const sourcePath = await realpath(fileURLToPath(new URL(url)));
+        const sharedRoot = await realpath(getSharedTempRoot());
+        const relative = path.relative(sharedRoot, sourcePath);
+        if (
+          !relative
+          || relative === '..'
+          || relative.startsWith(`..${path.sep}`)
+          || path.isAbsolute(relative)
+        ) {
+          throw new Error('Refusing file URL outside the configured shared temp root.');
+        }
+        const sourceStats = await stat(sourcePath);
+        if (!sourceStats.isFile() || sourceStats.size < 1) throw new Error('Local Bot API file is empty.');
+        if (maxBytes !== undefined && sourceStats.size > maxBytes) {
+          throw new DownloadSizeLimitError(sourceStats.size, maxBytes);
+        }
+        await copyFile(sourcePath, filePath, fsConstants.COPYFILE_EXCL);
+        return filePath;
+      }
       const resp = await axios.get<NodeJS.ReadableStream>(url, {
         responseType: 'stream',
         timeout: 30_000,
@@ -338,6 +376,132 @@ export async function downloadToTemp(
   throw lastErr;
 }
 
+/** Download the first working URL in priority order. */
+export async function downloadToTempFromCandidates(
+  urls: readonly string[],
+  fileName?: string,
+  retries = 3,
+  maxBytes?: number,
+): Promise<string> {
+  const candidates = Array.from(new Set(
+    urls.map(url => url.trim()).filter(Boolean),
+  ));
+  if (candidates.length === 0) throw new Error('No media URL candidates were provided.');
+
+  const errors: unknown[] = [];
+  for (const url of candidates) {
+    try {
+      return await downloadToTemp(url, fileName, retries, maxBytes);
+    } catch (error) {
+      if (error instanceof DownloadSizeLimitError) throw error;
+      errors.push(error);
+    }
+  }
+  throw new AggregateError(
+    errors,
+    `Failed to download media from ${candidates.length} URL candidate(s).`,
+  );
+}
+
+export interface SpriteSheetLayout {
+  frames: number;
+  frameWidth: number;
+  frameHeight: number;
+  direction: 'horizontal' | 'vertical';
+}
+
+/** Resolve equally sized frames from a horizontal or vertical sticker sheet. */
+export function getSpriteSheetLayout(
+  width: number,
+  height: number,
+  declaredFrames = 0,
+): SpriteSheetLayout {
+  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1) {
+    throw new Error('Sprite dimensions must be positive integers.');
+  }
+  const requested = Number.isSafeInteger(declaredFrames) && declaredFrames > 1
+    ? declaredFrames
+    : 0;
+  if (requested > 1 && width % requested === 0) {
+    return {
+      frames: requested,
+      frameWidth: width / requested,
+      frameHeight: height,
+      direction: 'horizontal',
+    };
+  }
+  if (requested > 1 && height % requested === 0) {
+    return {
+      frames: requested,
+      frameWidth: width,
+      frameHeight: height / requested,
+      direction: 'vertical',
+    };
+  }
+  if (width > height && width % height === 0) {
+    return {
+      frames: width / height,
+      frameWidth: height,
+      frameHeight: height,
+      direction: 'horizontal',
+    };
+  }
+  if (height > width && height % width === 0) {
+    return {
+      frames: height / width,
+      frameWidth: width,
+      frameHeight: width,
+      direction: 'vertical',
+    };
+  }
+  return { frames: 1, frameWidth: width, frameHeight: height, direction: 'horizontal' };
+}
+
+/** Convert a Zalo sprite sheet into a looping Telegram-compatible GIF. */
+export async function convertSpriteSheetToGif(
+  inputPath: string,
+  declaredFrames: number,
+  frameDurationMs: number,
+): Promise<string> {
+  mkdirSync(TMP_DIR, { recursive: true });
+  const dimensions = await imageSizeFromFile(inputPath);
+  if (!dimensions.width || !dimensions.height) {
+    throw new Error('Cannot read sticker sprite dimensions.');
+  }
+  const layout = getSpriteSheetLayout(dimensions.width, dimensions.height, declaredFrames);
+  if (layout.frames < 2 || layout.frames > 600) {
+    throw new Error('Sticker sprite must contain between 2 and 600 frames.');
+  }
+  const duration = Number.isFinite(frameDurationMs)
+    ? Math.min(1_000, Math.max(20, frameDurationMs))
+    : 100;
+  const frameRate = (1_000 / duration).toFixed(6);
+  const position = layout.direction === 'horizontal'
+    ? `x='mod(n\\,${layout.frames})*${layout.frameWidth}':y=0`
+    : `x=0:y='mod(n\\,${layout.frames})*${layout.frameHeight}'`;
+  const outputPath = path.join(
+    TMP_DIR,
+    `zalo_sticker_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.gif`,
+  );
+  try {
+    await runFfmpeg([
+      '-y',
+      '-loop', '1',
+      '-framerate', frameRate,
+      '-i', inputPath,
+      '-vf', `crop=${layout.frameWidth}:${layout.frameHeight}:${position},format=rgba`,
+      '-frames:v', String(layout.frames),
+      '-loop', '0',
+      outputPath,
+    ], 'ffmpeg Zalo sticker sprite');
+    if (await fileSize(outputPath) < 1) throw new Error('Sticker sprite conversion produced an empty GIF.');
+    return outputPath;
+  } catch (error) {
+    await unlink(outputPath).catch(() => undefined);
+    throw error;
+  }
+}
+
 /**
  * Copies a durable media object to the managed temp directory while restoring
  * its logical filename extension for provider SDKs that classify uploads from
@@ -353,7 +517,7 @@ export async function materializeTempFile(
   if (!sourceStats.isFile() || sourceStats.size < 1) {
     throw new Error(`Cannot materialize an empty or non-regular file: ${source}`);
   }
-  const baseName = sanitizeTempFileName(fileName);
+  const baseName = sanitizeFileName(fileName);
   const destination = path.join(
     TMP_DIR,
     `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`,

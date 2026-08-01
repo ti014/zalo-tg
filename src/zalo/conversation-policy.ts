@@ -16,6 +16,7 @@ export interface ZaloConversationPolicyInput {
   muteState: boolean | undefined;
   strangerState: boolean | undefined;
   skipMutedGroups: boolean;
+  muteSilent?: boolean;
   skipStrangerMessages: boolean;
 }
 
@@ -29,7 +30,7 @@ export interface ZaloConversationPolicyDecision {
 export function decideZaloConversationPolicy(
   input: ZaloConversationPolicyInput,
 ): ZaloConversationPolicyDecision {
-  const silent = input.muteState === true;
+  const silent = input.muteState === true && input.muteSilent !== false;
   if (input.type === 1 && input.skipMutedGroups && silent) {
     return { forward: false, silent: true, reason: 'muted_group', strangerStateUnknown: false };
   }

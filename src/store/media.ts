@@ -58,14 +58,23 @@ export const mediaGroupStore = {
   },
 };
 
+interface ZaloAlbumItem {
+  urls:      string[];
+  msgIds:    string[];
+  zaloQuote: ZaloQuoteData | undefined;
+}
+
 interface ZaloAlbumBuffer {
   timer:      ReturnType<typeof setTimeout>;
-  urls:       string[];
+  items:      ZaloAlbumItem[];
   senderName: string;
   topicId:    number;
-  tgBase:     { message_thread_id: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
-  zaloMsgIds: string[];
-  zaloQuote:  ZaloQuoteData | undefined;
+  tgBase:     {
+    message_thread_id: number;
+    disable_notification?: boolean;
+    reply_parameters?: { message_id: number; allow_sending_without_reply: boolean };
+  };
+  caption?:   string;
 }
 
 const _zaloAlbumBuffers = new Map<string, ZaloAlbumBuffer>();
@@ -73,29 +82,53 @@ const _zaloAlbumBuffers = new Map<string, ZaloAlbumBuffer>();
 export const zaloAlbumStore = {
   add(
     key: string,
-    url: string,
-    msgId: string,
-    meta: Omit<ZaloAlbumBuffer, 'timer' | 'urls' | 'zaloMsgIds'>,
+    urls: readonly string[],
+    msgIds: readonly string[],
+    caption: string | undefined,
+    meta: Omit<ZaloAlbumBuffer, 'timer' | 'items' | 'caption'> & {
+      zaloQuote: ZaloQuoteData | undefined;
+    },
     onFlush: (buf: Omit<ZaloAlbumBuffer, 'timer'>) => void,
   ): void {
+    const candidates = Array.from(new Set(urls.map(url => url.trim()).filter(Boolean)));
+    if (candidates.length === 0) return;
+    const { zaloQuote, ...bufferMeta } = meta;
+    const item: ZaloAlbumItem = {
+      urls: candidates,
+      msgIds: Array.from(new Set(msgIds.map(String).map(id => id.trim()).filter(Boolean))),
+      zaloQuote,
+    };
+    const flush = (buffer: ZaloAlbumBuffer): void => {
+      _zaloAlbumBuffers.delete(key);
+      safeFlush('zaloAlbumStore', () => onFlush({
+        items: buffer.items,
+        senderName: buffer.senderName,
+        topicId: buffer.topicId,
+        tgBase: buffer.tgBase,
+        caption: buffer.caption,
+      }));
+    };
+    const flushDelayMs = 600;
     const existing = _zaloAlbumBuffers.get(key);
     if (existing) {
       clearTimeout(existing.timer);
-      existing.urls.push(url);
-      existing.zaloMsgIds.push(msgId);
-      existing.timer = setTimeout(() => {
-        _zaloAlbumBuffers.delete(key);
-        safeFlush('zaloAlbumStore', () => onFlush({ urls: existing.urls, zaloMsgIds: existing.zaloMsgIds, ...meta }));
-      }, 200);
+      const incomingUrls = new Set(item.urls);
+      const duplicate = existing.items.find(existingItem =>
+        existingItem.urls.some(url => incomingUrls.has(url)));
+      if (duplicate) {
+        duplicate.urls = Array.from(new Set([...duplicate.urls, ...item.urls]));
+        duplicate.msgIds = Array.from(new Set([...duplicate.msgIds, ...item.msgIds]));
+      } else {
+        existing.items.push(item);
+      }
+      if (!existing.caption && caption) existing.caption = caption;
+      existing.timer = setTimeout(() => flush(existing), flushDelayMs);
     } else {
       const buf: ZaloAlbumBuffer = {
-        ...meta,
-        urls: [url],
-        zaloMsgIds: [msgId],
-        timer: setTimeout(() => {
-          _zaloAlbumBuffers.delete(key);
-          safeFlush('zaloAlbumStore', () => onFlush({ urls: buf.urls, zaloMsgIds: buf.zaloMsgIds, ...meta }));
-        }, 200),
+        ...bufferMeta,
+        items: [item],
+        caption,
+        timer: setTimeout(() => flush(buf), flushDelayMs),
       };
       _zaloAlbumBuffers.set(key, buf);
     }

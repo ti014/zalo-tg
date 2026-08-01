@@ -9,6 +9,14 @@ import { confirmDeleteTopicKeyboard, helpKeyboard, topicKeyboard } from './ui/ke
 import { renderDeleteTopicConfirm, renderHelp, renderTopicCard } from './ui/renderers.js';
 import { buildMenuView, buildSettingsView, buildStatusView, type UiView } from './ui/status.js';
 import { runZaloRequest } from '../zalo/rate-limit.js';
+import { getFriendRequestPage } from './commands/friendrequests.js';
+import {
+  adminBackMarkup,
+  adminMenuMarkup,
+  buildAdminCacheSnapshot,
+  renderAdminCache,
+  renderAdminLookupHelp,
+} from './commands/admin.js';
 
 async function doLockPoll(entry: import('../store/index.js').PollEntry, api: ZaloAPI): Promise<void> {
   await runZaloRequest(
@@ -75,10 +83,89 @@ async function editUiMessage(ctx: UiMessageContext, view: UiView): Promise<void>
   });
 }
 
-export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void {
+export function registerCallbackHandler({
+  bot,
+  getApi,
+  deliveryRepository,
+  requestRestart,
+}: TgHandlerContext): void {
   bot.on('callback_query', async (ctx) => {
     const data = 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : undefined;
     const currentApi = getApi();
+
+    if (data?.startsWith('restart:')) {
+      const [, action, requesterId] = data.split(':');
+      if (requesterId !== String(ctx.from.id)) {
+        await ctx.answerCbQuery('Yêu cầu restart này thuộc người dùng khác.', { show_alert: true });
+        return;
+      }
+      if (action === 'cancel') {
+        await ctx.answerCbQuery('Đã hủy');
+        await ctx.editMessageText('Đã hủy khởi động lại.').catch(() => undefined);
+        return;
+      }
+      if (action !== 'confirm' || !requestRestart) {
+        await ctx.answerCbQuery('Runtime không hỗ trợ restart.', { show_alert: true });
+        return;
+      }
+      await ctx.answerCbQuery('Đang khởi động lại');
+      await ctx.editMessageText(
+        'Bridge đang dừng worker có kiểm soát; supervisor sẽ khởi động process mới.',
+      ).catch(() => undefined);
+      if (!requestRestart()) {
+        await ctx.reply('Bridge đã có một shutdown khác đang chạy.').catch(() => undefined);
+      }
+      return;
+    }
+
+    if (data?.startsWith('admin:')) {
+      const action = data.slice('admin:'.length);
+      try {
+        if (action === 'close') {
+          await ctx.answerCbQuery('Đã đóng');
+          await ctx.deleteMessage().catch(() => undefined);
+          return;
+        }
+        if (action === 'menu') {
+          await ctx.editMessageText('<b>Admin panel</b>\nChọn mục cần kiểm tra:', {
+            parse_mode: 'HTML',
+            reply_markup: adminMenuMarkup,
+          });
+          await ctx.answerCbQuery('Admin panel');
+          return;
+        }
+        if (action === 'status') {
+          const status = await buildStatusView(getApi, { forceRefresh: true, detailed: true });
+          await ctx.editMessageText(status.text, {
+            parse_mode: 'HTML',
+            reply_markup: adminBackMarkup,
+          });
+          await ctx.answerCbQuery('Trạng thái');
+          return;
+        }
+        if (action === 'cache') {
+          await ctx.editMessageText(
+            renderAdminCache(buildAdminCacheSnapshot(deliveryRepository)),
+            { parse_mode: 'HTML', reply_markup: adminBackMarkup },
+          );
+          await ctx.answerCbQuery('Cache và durable queue');
+          return;
+        }
+        if (action === 'lookup') {
+          await ctx.editMessageText(renderAdminLookupHelp(), {
+            parse_mode: 'HTML',
+            reply_markup: adminBackMarkup,
+          });
+          await ctx.answerCbQuery('Tra mapping');
+          return;
+        }
+        await ctx.answerCbQuery('Thao tác không hợp lệ');
+      } catch (error) {
+        console.error('[cb/admin]', error);
+        await ctx.answerCbQuery('Không tải được admin panel').catch(() => undefined);
+      }
+      return;
+    }
 
     if (data?.startsWith('ui:')) {
       try {
@@ -220,6 +307,67 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
       return;
     }
 
+    if (data?.startsWith('frq_pg:')) {
+      if (!currentApi) {
+        await ctx.answerCbQuery('Zalo chưa kết nối');
+        return;
+      }
+      const pageNumber = Number(data.slice('frq_pg:'.length));
+      try {
+        const page = await getFriendRequestPage(currentApi, pageNumber);
+        await ctx.editMessageText(page.text, {
+          parse_mode: 'HTML',
+          ...(page.replyMarkup ? { reply_markup: page.replyMarkup } : {}),
+        });
+        await ctx.answerCbQuery();
+      } catch (error) {
+        console.error('[cb/frq_pg]', error);
+        await ctx.answerCbQuery('Không tải được trang lời mời');
+      }
+      return;
+    }
+
+    if (data?.startsWith('afr:')) {
+      const userId = data.slice('afr:'.length);
+      if (!userId || !currentApi) {
+        await ctx.answerCbQuery('Zalo chưa kết nối');
+        return;
+      }
+      try {
+        await runZaloRequest(
+          { label: `acceptFriendRequest(${userId})`, priority: 'high' },
+          () => currentApi.acceptFriendRequest(userId),
+        );
+        friendsCache.clear();
+        await ctx.answerCbQuery('Đã chấp nhận lời mời kết bạn');
+        await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+      } catch (error) {
+        console.error('[cb/afr]', error);
+        await ctx.answerCbQuery('Không thể chấp nhận lời mời');
+      }
+      return;
+    }
+
+    if (data?.startsWith('ufr:')) {
+      const userId = data.slice('ufr:'.length);
+      if (!userId || !currentApi) {
+        await ctx.answerCbQuery('Zalo chưa kết nối');
+        return;
+      }
+      try {
+        await runZaloRequest(
+          { label: `undoFriendRequest(${userId})`, priority: 'high' },
+          () => currentApi.undoFriendRequest(userId),
+        );
+        await ctx.answerCbQuery('Đã thu hồi lời mời kết bạn');
+        await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+      } catch (error) {
+        console.error('[cb/ufr]', error);
+        await ctx.answerCbQuery('Không thể thu hồi lời mời');
+      }
+      return;
+    }
+
     if (data?.startsWith('fr:')) {
       const [, action, fromUid] = data.split(':');
       if (!fromUid || !currentApi) {
@@ -293,6 +441,34 @@ export function registerCallbackHandler({ bot, getApi }: TgHandlerContext): void
       } catch (err) {
         console.error('[cb/jgi]', err);
         await ctx.answerCbQuery('❌ Không thể tham gia nhóm');
+      }
+      return;
+    }
+
+    if (data?.startsWith('gm:')) {
+      const [, action, groupId, uid] = data.split(':');
+      if (!groupId || !uid || !currentApi || (action !== 'approve' && action !== 'reject')) {
+        await ctx.answerCbQuery('Dữ liệu hoặc phiên Zalo không hợp lệ');
+        return;
+      }
+      try {
+        await runZaloRequest(
+          { label: `reviewPendingMemberRequest(${groupId})`, priority: 'high' },
+          () => currentApi.reviewPendingMemberRequest(
+            { members: [uid], isApprove: action === 'approve' },
+            groupId,
+          ),
+        );
+        const label = action === 'approve' ? 'Đã duyệt' : 'Đã từ chối';
+        await ctx.answerCbQuery(label);
+        await ctx.editMessageReplyMarkup(undefined).catch(() => undefined);
+        const previous = ctx.callbackQuery.message && 'text' in ctx.callbackQuery.message
+          ? ctx.callbackQuery.message.text ?? ''
+          : '';
+        await ctx.editMessageText(`${previous}\n\n${label}`, { parse_mode: 'HTML' }).catch(() => undefined);
+      } catch (error) {
+        console.error('[cb/gm]', error);
+        await ctx.answerCbQuery('Xử lý yêu cầu tham gia thất bại');
       }
       return;
     }

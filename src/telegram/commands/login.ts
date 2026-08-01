@@ -1,9 +1,9 @@
 import type { TgHandlerContext } from '../types.js';
-import { handleLoginCommand } from '../helpers.js';
+import { handleAppLoginCommand, handleLoginCommand } from '../helpers.js';
 import { config } from '../../config.js';
 
 export function registerLoginCommand({ bot, setApi, onZaloLogin }: TgHandlerContext): void {
-  bot.command('login', async (ctx) => {
+  const registerWebLogin = (command: 'login' | 'loginweb') => bot.command(command, async (ctx) => {
     const isPrivate   = ctx.chat.type === 'private';
     const isFromGroup = ctx.chat.id === config.telegram.groupId;
     if (!isPrivate && !isFromGroup) {
@@ -14,6 +14,22 @@ export function registerLoginCommand({ bot, setApi, onZaloLogin }: TgHandlerCont
     await handleLoginCommand(ctx.chat.id, threadId, (newApi) => {
       setApi(newApi);
       void onZaloLogin(newApi).catch((e: unknown) => console.error('[/login] onZaloLogin error:', e));
+    });
+  });
+
+  registerWebLogin('login');
+  registerWebLogin('loginweb');
+
+  bot.command('loginapp', async (ctx) => {
+    const isPrivate = ctx.chat.type === 'private';
+    const isFromGroup = ctx.chat.id === config.telegram.groupId;
+    if (!isPrivate && !isFromGroup) return;
+    const threadId = isFromGroup ? ctx.message.message_thread_id : undefined;
+    await handleAppLoginCommand(ctx.chat.id, threadId, (newApi) => {
+      setApi(newApi);
+      void onZaloLogin(newApi).catch((error: unknown) => {
+        console.error('[/loginapp] onZaloLogin error:', error);
+      });
     });
   });
 }

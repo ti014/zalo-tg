@@ -248,6 +248,12 @@ function prepareMappingClear(repository: DeliveryRepository): MappingClearPrepar
   };
 }
 
+function requestOperatorRestart(): boolean {
+  if (shuttingDown) return false;
+  void shutdown('operatorRestart', 0);
+  return true;
+}
+
 process.on('unhandledRejection', (reason) => {
   console.error('[Boot] Unhandled rejection — exiting:', reason);
   void shutdown('unhandledRejection', 1);
@@ -457,6 +463,9 @@ async function main(): Promise<void> {
   }, {
     deliveryRepository,
     prepareMappingClear: () => prepareMappingClear(deliveryRepository),
+    ...(config.runtime.restartCommandEnabled
+      ? { requestRestart: requestOperatorRestart }
+      : {}),
     onFatal: error => {
       console.error('[Boot] Durable delivery fatal error:', error);
       void shutdown('durableDeliveryFatal', 1);

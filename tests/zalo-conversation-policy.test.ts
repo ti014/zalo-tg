@@ -75,6 +75,21 @@ test('conversation policy only skips explicitly enabled muted groups or confirme
   });
 });
 
+test('conversation policy can mirror a muted thread with notifications enabled', () => {
+  assert.deepEqual(decideZaloConversationPolicy({
+    type: 1,
+    muteState: true,
+    strangerState: false,
+    skipMutedGroups: false,
+    muteSilent: false,
+    skipStrangerMessages: false,
+  }), {
+    forward: true,
+    silent: false,
+    strangerStateUnknown: false,
+  });
+});
+
 test('mute policy resolves muted group and muted direct conversation from one cached response', async () => {
   clearZaloPolicyCaches();
   let calls = 0;

@@ -74,6 +74,36 @@ export function registerSearchCommand({ bot, getApi }: TgHandlerContext): void {
       }
     }
 
+    // Newer Zalo API versions can resolve a username directly even when the
+    // friend cache is stale or the account is not in the local cache.
+    try {
+      const user = await currentApi.findUserByUsername(query) as {
+        uid?: string;
+        display_name?: string;
+        zalo_name?: string;
+      } | undefined;
+      if (user?.uid) {
+        const displayName = user.display_name || user.zalo_name || `Zalo ${user.uid}`;
+        const existingTopicId = store.getTopicByZalo(user.uid, 0);
+        const button = existingTopicId !== undefined
+          ? { text: `👤 ${displayName} ✅`, callback_data: `sc:${user.uid}` }
+          : { text: `👤 ${displayName}`, callback_data: `sc:${user.uid}` };
+        await ctx.telegram.sendMessage(
+          config.telegram.groupId,
+          `🔍 Tìm thấy theo username <b>${escapeHtml(query)}</b>:\n`
+            + '✅ = đã có topic • Nhấn để mở nếu đã map, hoặc tạo nếu chưa có',
+          {
+            ...replyOpts,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: [[button]] },
+          },
+        );
+        return;
+      }
+    } catch {
+      // Continue to cache search when the provider has no username endpoint.
+    }
+
     if (!friendsCache.isFresh()) {
       try {
         const raw = await currentApi.getAllFriends() as Array<{ userId: string; displayName: string }> | undefined;

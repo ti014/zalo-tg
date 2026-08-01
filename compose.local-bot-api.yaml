@@ -1,0 +1,64 @@
+services:
+  shared-temp-init:
+    image: ${BRIDGE_IMAGE:-zalo-tg-bridge:local}
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        install -d -m 1777 /var/lib/telegram-bot-api
+    network_mode: none
+    read_only: true
+    restart: "no"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - telegram-local-data:/var/lib/telegram-bot-api
+
+  telegram-bot-api:
+    image: ${TG_LOCAL_API_IMAGE:-aiogram/telegram-bot-api:latest}
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TG_API_ID:?TG_API_ID is required}
+      TELEGRAM_API_HASH: ${TG_API_HASH:?TG_API_HASH is required}
+      TELEGRAM_LOCAL: "1"
+    depends_on:
+      shared-temp-init:
+        condition: service_completed_successfully
+    volumes:
+      - telegram-local-data:/var/lib/telegram-bot-api
+    expose:
+      - "8081"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8081"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  bridge:
+    environment:
+      LOCAL_BOT_API: "true"
+      TG_LOCAL_SERVER: http://telegram-bot-api:8081
+      ZALO_TG_SHARED_TMP_ROOT: /var/lib/telegram-bot-api
+    depends_on:
+      shared-temp-init:
+        condition: service_completed_successfully
+      telegram-bot-api:
+        condition: service_healthy
+    volumes:
+      - telegram-local-data:/var/lib/telegram-bot-api
+
+volumes:
+  telegram-local-data:
+    name: ${TG_LOCAL_DATA_VOLUME:-zalo-tg-telegram-local}
