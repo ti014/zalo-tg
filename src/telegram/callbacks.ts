@@ -83,6 +83,23 @@ async function editUiMessage(ctx: UiMessageContext, view: UiView): Promise<void>
   });
 }
 
+function isExpiredCallbackQueryError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false;
+  const candidate = error as {
+    code?: unknown;
+    message?: unknown;
+    response?: { error_code?: unknown; description?: unknown };
+  };
+  const code = candidate.code ?? candidate.response?.error_code;
+  const descriptions = [candidate.message, candidate.response?.description]
+    .filter((value): value is string => typeof value === 'string');
+  return code === 400
+    && descriptions.some(description => (
+      description.includes('query is too old and response timeout expired')
+      || description.includes('query ID is invalid')
+    ));
+}
+
 export function registerCallbackHandler({
   bot,
   getApi,
@@ -108,7 +125,15 @@ export function registerCallbackHandler({
         await ctx.answerCbQuery('Runtime không hỗ trợ restart.', { show_alert: true });
         return;
       }
-      await ctx.answerCbQuery('Đang khởi động lại');
+      try {
+        await ctx.answerCbQuery('Đang khởi động lại');
+      } catch (error) {
+        // A restart can stop long polling before Telegram advances its update
+        // offset. The replacement process may then receive the same callback,
+        // whose query ID has already expired. Do not execute restart twice.
+        if (isExpiredCallbackQueryError(error)) return;
+        throw error;
+      }
       await ctx.editMessageText(
         'Bridge đang dừng worker có kiểm soát; supervisor sẽ khởi động process mới.',
       ).catch(() => undefined);
