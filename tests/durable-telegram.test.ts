@@ -13,6 +13,7 @@ import {
   markDurableTelegramHandled,
   recordDurableTelegramFailure,
   recordDurableTelegramProviderMessageId,
+  recordDurableTelegramSkipped,
 } from '../src/application/durable-telegram.js';
 import {
   closeBridgeDatabase,
@@ -298,6 +299,40 @@ test('worker classifies uncertain outcome and an unhandled replay explicitly', a
       await waitFor(() => deliveryStatus(db, 21) === 'PERMANENT_FAILED');
       await relay.stop();
     });
+  });
+});
+
+test('worker records Telegram service events as audited skips', async () => {
+  await withDatabase(async (db, repository) => {
+    const relay = new DurableTelegramRelay({
+      repository,
+      bot: { handleUpdate: async () => undefined } as unknown as Telegraf,
+      telegramChatId: TELEGRAM_CHAT_ID,
+      getApi: () => ({}) as ZaloAPI,
+      getTopic: () => TOPIC,
+      onFatal: error => { throw error; },
+      replayUpdate: async () => {
+        markDurableTelegramHandled();
+        recordDurableTelegramSkipped(
+          'SKIPPED_TELEGRAM_SERVICE_EVENT',
+          'Not a user message.',
+        );
+      },
+      pollIntervalMs: 10,
+    });
+
+    const update = telegramUpdate(22);
+    await relay.middleware()(contextFor(update), async () => assert.fail('captured inline'));
+    relay.start();
+    await waitFor(() => deliveryStatus(db, 22) === 'SKIPPED');
+    const audit = db.prepare(`
+      SELECT reason_code, reason FROM delivery_skip_audits
+    `).get() as { reason_code: string; reason: string };
+    assert.deepEqual(audit, {
+      reason_code: 'SKIPPED_TELEGRAM_SERVICE_EVENT',
+      reason: 'Not a user message.',
+    });
+    await relay.stop();
   });
 });
 

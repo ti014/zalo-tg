@@ -1,13 +1,14 @@
 import type { BridgeDatabase } from '../infrastructure/database/database.js';
 import { msgStore } from '../store/messages.js';
 import { settingsStore, type AppSettings } from '../store/settings.js';
-import { store, type TopicEntry } from '../store/topics.js';
+import { store, type TopicEntry, type TopicNameSource } from '../store/topics.js';
 
 interface TopicRow {
   telegram_topic_id: number;
   zalo_thread_id: string;
   thread_type: 0 | 1;
   name: string;
+  name_source: TopicNameSource;
 }
 
 interface MessageLinkRow {
@@ -63,7 +64,7 @@ export function hydrateCompatibilityStores(
   telegramChatId: number,
 ): StoreHydrationResult {
   const topicRows = db.prepare(`
-    SELECT telegram_topic_id, zalo_thread_id, thread_type, name
+    SELECT telegram_topic_id, zalo_thread_id, thread_type, name, name_source
     FROM topic_links
     WHERE telegram_chat_id = ?
     ORDER BY telegram_topic_id
@@ -75,6 +76,7 @@ export function hydrateCompatibilityStores(
       zaloId: row.zalo_thread_id,
       type: row.thread_type,
       name: row.name,
+      nameSource: row.name_source,
     })),
     { synchronizeShadow: false },
   );

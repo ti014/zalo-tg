@@ -72,6 +72,13 @@ export function registerHistoryListener(api: ZaloAPI): void {
   });
 }
 
+/** Ask Zalo to replay its recent direct and group messages after a connection gap. */
+export function requestRecentHistoryReplay(api: ZaloAPI): void {
+  registerHistoryListener(api);
+  api.listener.requestOldMessages(ThreadType.User);
+  api.listener.requestOldMessages(ThreadType.Group);
+}
+
 export function setHistoryReplayHandler(handler: ((message: ZaloMessage) => Promise<void>) | null): void {
   replayHandler = handler;
 }

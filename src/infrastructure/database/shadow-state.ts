@@ -77,9 +77,18 @@ function upsertTopic(db: BridgeDatabase, chatId: number, entry: TopicEntry): voi
   `).run(chatId, entry.topicId, entry.zaloId, entry.type);
   db.prepare(`
     INSERT INTO topic_links(
-      telegram_chat_id, telegram_topic_id, zalo_thread_id, thread_type, name, source, updated_at
-    ) VALUES (?, ?, ?, ?, ?, 'runtime', ?)
-  `).run(chatId, entry.topicId, entry.zaloId, entry.type, entry.name, now);
+      telegram_chat_id, telegram_topic_id, zalo_thread_id, thread_type,
+      name, name_source, source, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, 'runtime', ?)
+  `).run(
+    chatId,
+    entry.topicId,
+    entry.zaloId,
+    entry.type,
+    entry.name,
+    entry.nameSource ?? 'legacy',
+    now,
+  );
 }
 
 function upsertMessageLink(

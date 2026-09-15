@@ -13,6 +13,7 @@ const {
   isTelegramFileUriRejection,
   isPathWithinSharedRoot,
   sendTelegramAnimationWithFallback,
+  sendTelegramPhotoWithFallback,
 } = await import('../src/telegram/media-input.js');
 
 async function consumeMedia(media: unknown): Promise<void> {
@@ -98,6 +99,65 @@ test('animation delivery suppresses format fallback after an ambiguous timeout',
       /timed out/,
     );
     assert.deepEqual(calls, ['animation']);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('invalid Telegram photo dimensions fall back to a document', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zalo-photo-fallback-'));
+  const filePath = path.join(directory, 'photo.jpg');
+  writeFileSync(filePath, 'image');
+  const calls: string[] = [];
+  try {
+    const result = await sendTelegramPhotoWithFallback(
+      filePath,
+      'photo.jpg',
+      {
+        photo: async media => {
+          await consumeMedia(media);
+          calls.push('photo');
+          throw Object.assign(new Error('400: Bad Request: PHOTO_INVALID_DIMENSIONS'), { code: 400 });
+        },
+        document: async media => {
+          await consumeMedia(media);
+          calls.push('document');
+          return { message_id: 43 };
+        },
+      },
+    );
+    assert.deepEqual(result, { message_id: 43 });
+    assert.deepEqual(calls, ['photo', 'document']);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('ambiguous photo timeout does not send a duplicate document', async () => {
+  const directory = mkdtempSync(path.join(os.tmpdir(), 'zalo-photo-timeout-'));
+  const filePath = path.join(directory, 'photo.jpg');
+  writeFileSync(filePath, 'image');
+  let documentCalls = 0;
+  try {
+    await assert.rejects(
+      sendTelegramPhotoWithFallback(
+        filePath,
+        'photo.jpg',
+        {
+          photo: async media => {
+            await consumeMedia(media);
+            throw Object.assign(new Error('request timed out'), { code: 'ETIMEDOUT' });
+          },
+          document: async media => {
+            await consumeMedia(media);
+            documentCalls += 1;
+            return { message_id: 44 };
+          },
+        },
+      ),
+      /timed out/,
+    );
+    assert.equal(documentCalls, 0);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }

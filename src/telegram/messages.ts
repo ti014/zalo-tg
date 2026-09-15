@@ -35,6 +35,7 @@ import {
   markDurableTelegramHandled,
   recordDurableTelegramFailure,
   recordDurableTelegramProviderMessageId,
+  recordDurableTelegramSkipped,
 } from '../application/durable-telegram.js';
 import { isAmbiguousProviderFailure } from '../domain/provider-errors.js';
 import { downloadTelegramMediaDurably } from '../application/durable-media.js';
@@ -1159,6 +1160,13 @@ export async function processTelegramMessage(
           }
           void body;
         }
+        return;
+      }
+      if ('forum_topic_edited' in msg) {
+        recordDurableTelegramSkipped(
+          'SKIPPED_TELEGRAM_SERVICE_EVENT',
+          'Telegram forum topic metadata changes are not user messages.',
+        );
         return;
       }
       recordDurableTelegramFailure(Object.assign(

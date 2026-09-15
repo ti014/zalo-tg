@@ -8,6 +8,11 @@ Bridge hai chiều giữa Zalo và Telegram. Mỗi cuộc trò chuyện trực t
 
 Bridge chạy như một process Node.js lâu dài. SQLite và Docker named volume lưu state, media, mapping và delivery đang chờ qua các lần restart, nâng cấp và restore có kiểm soát.
 
+Topic group được route bằng Zalo group ID, không bằng tên. Tên Zalo là nguồn
+authoritative và được bridge tự đối soát sau login/reconnect cùng chu kỳ 30 phút;
+khi API metadata lỗi, bridge dùng tên đã lưu hoặc placeholder theo group ID thay
+vì tên thành viên gửi tin.
+
 ## Tính năng chính
 
 - Relay text và media hai chiều, tự động map conversation vào Forum Topic.

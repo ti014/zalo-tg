@@ -215,16 +215,48 @@ function isZaloMessage(value: unknown): value is ZaloMessage {
     && message.data !== null;
 }
 
+/**
+ * Return a deterministic representation of the fields the relay can observe.
+ * Zalo can attach transport/status metadata in a different shape when a live
+ * message is returned again through `old_messages`; that must not turn the
+ * same provider event into a fatal intake conflict.
+ */
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter(key => record[key] !== undefined)
+    .map(key => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+    .join(',')}}`;
+}
+
 function isEquivalentEnrichedReplay(storedPayload: unknown, incomingPayload: unknown): boolean {
   if (!isZaloMessage(storedPayload) || !isZaloMessage(incomingPayload)) return false;
-  const withoutLateAliases = (message: ZaloMessage): unknown => {
-    const data = { ...message.data } as Record<string, unknown>;
-    delete data.realMsgId;
-    delete data.cliMsgId;
-    return { ...message, data };
+  const relayVisiblePayload = (message: ZaloMessage): unknown => {
+    const data = message.data;
+    return {
+      type: message.type,
+      threadId: message.threadId,
+      isSelf: message.isSelf,
+      data: {
+        content: data.content,
+        msgId: data.msgId,
+        uidFrom: data.uidFrom,
+        dName: data.dName,
+        idTo: data.idTo,
+        ts: data.ts,
+        msgType: data.msgType,
+        ttl: data.ttl,
+        quote: data.quote,
+        mentions: data.mentions,
+        textProperties: data.textProperties,
+      },
+    };
   };
-  return JSON.stringify(withoutLateAliases(storedPayload))
-    === JSON.stringify(withoutLateAliases(incomingPayload));
+  return stableJson(relayVisiblePayload(storedPayload))
+    === stableJson(relayVisiblePayload(incomingPayload));
 }
 
 export class DurableZaloRelay {

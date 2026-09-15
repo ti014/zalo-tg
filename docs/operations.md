@@ -179,6 +179,14 @@ Kết quả thành công lần lượt là `alive` và `ready`, exit code bằng
 Bridge is not ready: storage=ready, telegram=ready, zalo=degraded
 ```
 
+Bridge chỉ chuyển Zalo sang `ready` sau khi WebSocket phát sự kiện
+`connected`. Nếu startup hoặc reconnect thất bại, runtime tiếp tục retry với
+exponential backoff tối đa 60 giây thay vì chờ `/login` thủ công. Sau mỗi kết
+nối thành công, bridge yêu cầu Zalo replay các direct message và group message
+gần nhất; durable source key hấp thụ event trùng. Đây là best-effort gap
+recovery, không phải cam kết full-history nếu thời gian offline dài hơn cửa sổ
+lịch sử mà Zalo trả về.
+
 Sau mỗi deploy hoặc restore, tiêu chí chấp nhận tối thiểu là:
 
 1. `docker compose ps` cho thấy container đang chạy.
@@ -214,6 +222,15 @@ Trong Telegram group đã cấu hình, owner chạy:
 Command hiển thị tổng số delivery theo trạng thái và tối đa 10 bản ghi vấn đề mỗi trang. Dùng `/queue 2` để xem trang tiếp theo và `/queue detail <delivery-id>` để xem source event, timestamp, provider receipt theo attempt, skip audit, multipart part state và lịch sử operator action.
 
 Nếu đổi Telegram group hoặc cần bỏ toàn bộ mapping cũ, owner dùng `/clear` để xem phạm vi rồi `/clear confirm`. Bridge chỉ nhận lệnh khi không còn delivery ở trạng thái chưa kết thúc, sau đó dừng listener/worker, xóa topic mapping và message mapping của riêng `TG_GROUP_ID` hiện tại trong một SQLite transaction rồi tự khởi động lại theo restart policy. Lệnh không xóa vật lý Telegram topic, không xóa Zalo chat và không xóa durable delivery audit. Tin Zalo mới sẽ tạo topic mapping mới. Nếu lệnh báo còn delivery đang hoạt động hoặc có vấn đề, dùng `/queue` để xử lý trước.
+
+Tên topic group lấy Zalo group metadata làm authority, còn routing luôn dùng
+`zalo_thread_id` và `thread_type`. Khi metadata tạm thời không khả dụng, bridge
+giữ tên mapping hiện có hoặc tạo placeholder `Nhóm Zalo <group-id>`; tên người
+gửi không bao giờ được dùng làm tên group. Sau mỗi lần Zalo login/reconnect và
+định kỳ 30 phút, bridge đối soát mapping thuộc `TG_GROUP_ID` hiện tại, sửa tên
+Telegram/SQLite khi Zalo trả metadata mới và ghi thống kê vào log
+`[Boot] Topic reconciliation`. Row legacy thuộc Telegram chat khác không bị sửa
+hoặc hydrate vào runtime hiện tại.
 
 `UNKNOWN` chặn các delivery đứng sau trong cùng conversation để giữ FIFO. Không retry mù vì có thể tạo tin nhắn trùng. Quy trình reconciliation (đối soát) là:
 
@@ -289,6 +306,8 @@ Ví dụ lựa chọn:
 
 - Telegram sang Zalo: `TG_DOWNLOAD_MAX_MB` mặc định là 20 MiB. Cloud Bot API bị chặn cấu hình ở 200 MiB; local mode cho phép cấu hình tới 2048 MiB. Thư viện Zalo có thể nạp toàn bộ attachment vào RAM, nên tăng ngưỡng vẫn phải kèm disk headroom và load test thực tế.
 - Zalo sang Telegram: file, GIF, video và voice vượt `TG_UPLOAD_PART_MB` (mặc định 45 MiB) được chia lossless thành `.part001`, `.part002`, ... rồi gửi tuần tự. Nếu Telegram chỉ nhận một phần, delivery chuyển `UNKNOWN` để operator đối soát thay vì tự gửi trùng.
+- Ảnh bị Telegram từ chối bằng `PHOTO_INVALID_DIMENSIONS` được gửi lại dưới dạng document; timeout mơ hồ không chạy fallback để tránh duplicate.
+- Poll option từ Zalo được cắt theo grapheme ở 100 ký tự. Payload Zalo malformed thiếu URL/nội dung tạo một notice trong topic thay vì biến mất im lặng. Telegram `forum_topic_edited` là service event và được audit thành `SKIPPED`, không phải delivery lỗi.
 - Timeout upload Telegram dùng `TG_UPLOAD_TIMEOUT_SEC` (mặc định 600 giây), tách khỏi timeout API thông thường 45 giây. Timeout không hủy chắc chắn request provider, nên kết quả vẫn đi vào `UNKNOWN`.
 - Album ở production durable mode được chuyển từng item theo FIFO thay vì gom bằng debounce trong RAM. Cách này có thể làm mất giao diện album gộp, nhưng mỗi item có delivery/idempotency state riêng và sống qua restart tốt hơn.
 - GIF gửi sang Zalo được nén về ngưỡng an toàn 5.000.000 byte; nếu vẫn vượt ngưỡng sau các preset nén, delivery thất bại.

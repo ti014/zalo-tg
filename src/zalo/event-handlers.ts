@@ -303,7 +303,9 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
             { name: topicName(renamedTo, 1) },
           );
           const existing = store.getEntryByTopic(topicId);
-          if (existing) store.set({ ...existing, name: renamedTo });
+          if (existing) {
+            store.set({ ...existing, name: renamedTo, nameSource: 'group_event' });
+          }
           invalidateCachedGroupInfo(groupId);
         }
         return;

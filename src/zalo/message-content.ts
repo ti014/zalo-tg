@@ -1,4 +1,5 @@
 import type { ZaloMediaContent } from './types.js';
+import { truncate } from '../utils/format.js';
 
 export interface ZaloLinkContent {
   href: string;
@@ -25,6 +26,20 @@ function firstNonBlank(values: readonly unknown[]): string | undefined {
   return values
     .find((value): value is string => typeof value === 'string' && value.trim().length > 0)
     ?.trim();
+}
+
+export function resolveZaloFallbackDetail(media: ZaloMediaContent): string | undefined {
+  return firstNonBlank([media.title, media.description, media.desc, media.action]);
+}
+
+export function normalizeZaloPollOptions(
+  options: ReadonlyArray<{ content: string }>,
+  maxLength = 100,
+): string[] {
+  return options.map((option, index) => truncate(
+    option.content.trim() || `Lựa chọn ${index + 1}`,
+    maxLength,
+  ));
 }
 
 /** Resolve URL variants emitted by different Zalo clients for chat.recommended. */

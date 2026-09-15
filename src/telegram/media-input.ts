@@ -48,7 +48,9 @@ export function telegramDocumentInput(
 
 export function telegramErrorCode(error: unknown): number | undefined {
   const response = (error as { response?: { error_code?: unknown } })?.response;
-  return typeof response?.error_code === 'number' ? response.error_code : undefined;
+  const direct = (error as { code?: unknown })?.code;
+  if (typeof response?.error_code === 'number') return response.error_code;
+  return typeof direct === 'number' ? direct : undefined;
 }
 
 export function telegramErrorDescription(error: unknown): string {
@@ -84,6 +86,42 @@ export interface TelegramAnimationOperations<T> {
   animation(media: TelegramLocalMedia): Promise<T>;
   video(media: TelegramLocalMedia): Promise<T>;
   document(media: TelegramDocumentMedia): Promise<T>;
+}
+
+export interface TelegramPhotoOperations<T> {
+  photo(media: TelegramLocalMedia): Promise<T>;
+  document(media: TelegramDocumentMedia): Promise<T>;
+}
+
+export function isTelegramPhotoFormatRejection(error: unknown): boolean {
+  return telegramErrorCode(error) === 400
+    && /PHOTO_INVALID_DIMENSIONS|IMAGE_PROCESS_FAILED|invalid image dimensions/i
+      .test(telegramErrorDescription(error));
+}
+
+/** Preserve an image payload as a document when Telegram cannot decode it as a photo. */
+export async function sendTelegramPhotoWithFallback<T>(
+  filePath: string,
+  fileName: string,
+  operations: TelegramPhotoOperations<T>,
+  label = 'Photo upload',
+): Promise<T> {
+  try {
+    return await withTelegramMediaFallback(
+      forceMultipart => operations.photo(telegramMediaInput(filePath, forceMultipart)),
+      label,
+    );
+  } catch (error) {
+    if (isAmbiguousProviderFailure(error) || !isTelegramPhotoFormatRejection(error)) throw error;
+    console.warn('[Telegram] Photo format rejected; trying document:', error);
+  }
+
+  return withTelegramMediaFallback(
+    forceMultipart => operations.document(
+      telegramDocumentInput(filePath, fileName, forceMultipart),
+    ),
+    `${label} document fallback`,
+  );
 }
 
 /** Preserve delivery by falling back animation → video → document on definitive rejections. */

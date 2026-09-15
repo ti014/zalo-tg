@@ -4,11 +4,23 @@ import { config } from '../config.js';
 import { writeJsonAtomicSync } from '../infrastructure/files/atomic-file.js';
 import { shadowTopicRemove, shadowTopicSet, shadowTopicsReplace } from '../infrastructure/database/shadow-state.js';
 
+export const TOPIC_NAME_SOURCES = [
+  'legacy',
+  'placeholder',
+  'contact',
+  'group_info',
+  'group_list',
+  'group_event',
+] as const;
+
+export type TopicNameSource = typeof TOPIC_NAME_SOURCES[number];
+
 export interface TopicEntry {
   topicId: number;
   zaloId:  string;
   type:    0 | 1;
   name:    string;
+  nameSource?: TopicNameSource;
 }
 
 interface StoreData {
@@ -22,14 +34,26 @@ let loadStatus: LoadStatus = 'missing';
 let loadFailure: Error | undefined;
 
 function normalize(data: StoreData): StoreData {
-  const topics = data.topics ?? {};
+  const topics: Record<string, TopicEntry> = {};
   const zaloIndex: Record<string, number> = {};
 
-  for (const entry of Object.values(topics)) {
-    zaloIndex[zaloKey(entry.zaloId, entry.type)] = entry.topicId;
+  for (const entry of Object.values(data.topics ?? {})) {
+    const normalized = normalizeEntry(entry);
+    topics[String(normalized.topicId)] = normalized;
+    zaloIndex[zaloKey(normalized.zaloId, normalized.type)] = normalized.topicId;
   }
 
   return { topics, zaloIndex };
+}
+
+function normalizeNameSource(value: unknown): TopicNameSource {
+  return TOPIC_NAME_SOURCES.includes(value as TopicNameSource)
+    ? value as TopicNameSource
+    : 'legacy';
+}
+
+function normalizeEntry(entry: TopicEntry): TopicEntry {
+  return { ...entry, nameSource: normalizeNameSource(entry.nameSource) };
 }
 
 function load(): StoreData {
@@ -73,19 +97,20 @@ export const store = {
     if (!Number.isSafeInteger(entry.topicId) || entry.topicId <= 1) {
       throw new Error(`Invalid Telegram forum topic ID: ${entry.topicId}`);
     }
-    const key = zaloKey(entry.zaloId, entry.type);
+    const normalized = normalizeEntry(entry);
+    const key = zaloKey(normalized.zaloId, normalized.type);
     const previousTopicId = _data.zaloIndex[key];
     if (previousTopicId !== undefined && previousTopicId !== entry.topicId) {
       delete _data.topics[String(previousTopicId)];
     }
-    const previousAtTopic = _data.topics[String(entry.topicId)];
+    const previousAtTopic = _data.topics[String(normalized.topicId)];
     if (previousAtTopic) {
       delete _data.zaloIndex[zaloKey(previousAtTopic.zaloId, previousAtTopic.type)];
     }
-    _data.topics[String(entry.topicId)] = entry;
-    _data.zaloIndex[key] = entry.topicId;
+    _data.topics[String(normalized.topicId)] = normalized;
+    _data.zaloIndex[key] = normalized.topicId;
     persist(_data);
-    shadowTopicSet(entry);
+    shadowTopicSet(normalized);
   },
 
   all(): TopicEntry[] {
@@ -101,12 +126,13 @@ export const store = {
       if (!Number.isSafeInteger(entry.topicId) || entry.topicId <= 1) continue;
       if (entry.type !== 0 && entry.type !== 1) continue;
       if (!entry.zaloId?.trim() || !entry.name?.trim()) continue;
-      topics[String(entry.topicId)] = {
+      topics[String(entry.topicId)] = normalizeEntry({
         topicId: entry.topicId,
         zaloId: String(entry.zaloId),
         type: entry.type,
         name: String(entry.name),
-      };
+        nameSource: entry.nameSource,
+      });
     }
     _data = normalize({ topics, zaloIndex: {} });
     persist(_data);

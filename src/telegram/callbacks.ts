@@ -1,5 +1,12 @@
 import type { TgHandlerContext } from './types.js';
-import { settingsStore, store, friendsCache, groupsCache, pollStore } from '../store/index.js';
+import {
+  settingsStore,
+  store,
+  friendsCache,
+  groupsCache,
+  pollStore,
+  type TopicNameSource,
+} from '../store/index.js';
 import { config } from '../config.js';
 import { escapeHtml } from '../utils/format.js';
 import { buildTopicUrl } from './helpers.js';
@@ -539,6 +546,7 @@ export function registerCallbackHandler({
     }
 
     let displayName: string | undefined;
+    let nameSource: TopicNameSource = isGroup ? 'placeholder' : 'contact';
     if (!isGroup) {
       displayName = friendsCache.search('', 0).find(f => f.userId === entityId)?.displayName;
       if (!displayName) {
@@ -551,13 +559,15 @@ export function registerCallbackHandler({
       }
       if (!displayName) displayName = `Zalo ${entityId}`;
     } else {
-      displayName = groupsCache.search('', 0).find(g => g.groupId === entityId)?.name;
+      displayName = groupsCache.get(entityId)?.name;
+      if (displayName) nameSource = 'group_list';
       if (!displayName) {
         try {
           const info = await currentApi?.getGroupInfo(entityId) as {
             gridInfoMap?: Record<string, { name: string }>;
           } | undefined;
           displayName = info?.gridInfoMap?.[entityId]?.name;
+          if (displayName) nameSource = 'group_info';
         } catch { /* ignore */ }
       }
       if (!displayName) displayName = `Nhóm ${entityId}`;
@@ -572,7 +582,13 @@ export function registerCallbackHandler({
         { icon_color: icon },
       );
       const topicId = topic.message_thread_id;
-      store.set({ topicId, zaloId: entityId, type: threadType, name: displayName });
+      store.set({
+        topicId,
+        zaloId: entityId,
+        type: threadType,
+        name: displayName,
+        nameSource,
+      });
       console.log(`[search/cb] Created ${isGroup ? 'group' : 'DM'} topic "${displayName}" (topicId=${topicId})`);
 
       await ctx.answerCbQuery('✅ Đã tạo topic!');

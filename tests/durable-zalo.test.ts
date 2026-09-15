@@ -146,6 +146,60 @@ test('enqueue deduplicates a replay enriched with additional provider aliases', 
   });
 });
 
+test('history replay ignores transport-only Zalo metadata but preserves relay-visible content', async () => {
+  await withRepository(async (repository, db) => {
+    const fatalErrors: Error[] = [];
+    const relay = new DurableZaloRelay({
+      repository,
+      processMessage: async () => assert.fail('delivery must remain offline in this test'),
+      onFatal: error => fatalErrors.push(error),
+    });
+    const original = zaloMessage('history-stable', 'conversation-a', {
+      dName: 'Sender',
+      content: { href: 'https://example.test/file', params: '{"size":1,"kind":"file"}' },
+    });
+    const replay = {
+      ...original,
+      data: {
+        ...original.data,
+        realMsgId: 'server-alias',
+        cliMsgId: 'client-alias',
+        status: 2,
+        propertyExt: { ext: 'late', color: 1 },
+        paramsExt: { platformType: 1, countUnread: 0 },
+      },
+    } as ZaloMessage;
+
+    relay.enqueue(original);
+    relay.enqueue(replay);
+
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM inbox_events').get().count, 1);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM deliveries').get().count, 1);
+    assert.deepEqual(fatalErrors, []);
+    await relay.stop();
+  });
+});
+
+test('history replay still rejects changed relay-visible content for the same Zalo identity', async () => {
+  await withRepository(async repository => {
+    const fatalErrors: Error[] = [];
+    const relay = new DurableZaloRelay({
+      repository,
+      processMessage: async () => assert.fail('delivery must remain offline in this test'),
+      onFatal: error => fatalErrors.push(error),
+    });
+    const original = zaloMessage('history-conflict');
+    const changed = zaloMessage('history-conflict', 'conversation-a', { content: 'different content' });
+
+    relay.enqueue(original);
+    relay.enqueue(changed);
+
+    assert.equal(fatalErrors.length, 1);
+    assert.match(fatalErrors[0]!.message, /Could not persist Zalo message/);
+    await relay.stop();
+  });
+});
+
 test('queued Zalo events replay in FIFO order within a conversation', async () => {
   await withRepository(async (repository, db) => {
     const processed: string[] = [];

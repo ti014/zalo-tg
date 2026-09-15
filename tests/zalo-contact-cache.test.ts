@@ -58,4 +58,26 @@ test('DM topics follow changed contact names while group topics only replace pla
   assert.equal(shouldReplaceStoredName('Tên cũ', 'Tên danh bạ mới', 'u1', 0), true);
   assert.equal(shouldReplaceStoredName('Nhóm ổn định', 'Tên khác', 'g1', 1), false);
   assert.equal(shouldReplaceStoredName('g1', 'Nhóm chính thức', 'g1', 1), true);
+  assert.equal(
+    shouldReplaceStoredName(
+      'Tên người gửi',
+      'Nhóm chính thức',
+      'g1',
+      1,
+      'legacy',
+      'group_info',
+    ),
+    true,
+  );
+  assert.equal(
+    shouldReplaceStoredName(
+      'Nhóm chính thức',
+      'Nhóm Zalo g1',
+      'g1',
+      1,
+      'group_info',
+      'placeholder',
+    ),
+    false,
+  );
 });

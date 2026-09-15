@@ -27,6 +27,12 @@ test('SQLite hydration preserves durable message history beyond bounded compatib
   const db = openBridgeDatabase(path.join(directory, 'bridge.db'));
   configureSqliteShadow(db, -1001);
   try {
+    db.prepare(`
+      INSERT INTO topic_links(
+        telegram_chat_id, telegram_topic_id, zalo_thread_id, thread_type,
+        name, name_source, source, updated_at
+      ) VALUES (-1001, 22, 'group-a', 1, 'Group A', 'group_info', 'runtime', 1)
+    `).run();
     const insertLink = db.prepare(`
       INSERT INTO message_links(
         telegram_chat_id, telegram_message_id, conversation_key, direction,
@@ -60,6 +66,9 @@ test('SQLite hydration preserves durable message history beyond bounded compatib
 
     const hydration = hydrateCompatibilityStores(db, -1001);
 
+    assert.equal(hydration.topics, 1);
+    const { store } = await import('../src/store/index.js');
+    assert.equal(store.getEntryByTopic(22)?.nameSource, 'group_info');
     assert.equal(hydration.incomingMessageLinks, 2_105);
     assert.equal(
       db.prepare('SELECT count(*) AS count FROM message_links').get().count,

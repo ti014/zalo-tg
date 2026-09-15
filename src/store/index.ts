@@ -1,4 +1,4 @@
-export { store, type TopicEntry } from './topics.js';
+export { store, type TopicEntry, type TopicNameSource } from './topics.js';
 export {
   msgStore,
   sentMessageAliases,

@@ -16,12 +16,16 @@ test('database enables WAL and applies all migrations idempotently', () => {
   try {
     let db = openBridgeDatabase(databasePath);
     assert.equal(db.pragma('journal_mode', { simple: true }), 'wal');
-    assert.equal(db.prepare('SELECT count(*) AS count FROM schema_migrations').get().count, 7);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM schema_migrations').get().count, 8);
+    assert.ok(
+      (db.pragma('table_info(topic_links)') as Array<{ name: string }>)
+        .some(column => column.name === 'name_source'),
+    );
     verifyDatabase(db);
     closeBridgeDatabase(db);
 
     db = openBridgeDatabase(databasePath);
-    assert.equal(db.prepare('SELECT count(*) AS count FROM schema_migrations').get().count, 7);
+    assert.equal(db.prepare('SELECT count(*) AS count FROM schema_migrations').get().count, 8);
     closeBridgeDatabase(db);
   } finally {
     rmSync(directory, { recursive: true, force: true });
@@ -104,12 +108,18 @@ test('current migrations preserve v5 deliveries, attempts, media, and operator a
         'UNKNOWN', 'v5 action', 21
       )
     `).run();
+    legacy.prepare(`
+      INSERT INTO topic_links(
+        telegram_chat_id, telegram_topic_id, zalo_thread_id,
+        thread_type, name, source, updated_at
+      ) VALUES (-1001, 77, 'group-v5', 1, 'Legacy group', 'runtime', 21)
+    `).run();
     legacy.close();
 
     const upgraded = openBridgeDatabase(databasePath);
     assert.equal(
       upgraded.prepare('SELECT count(*) AS count FROM schema_migrations').get().count,
-      7,
+      8,
     );
     assert.equal(
       upgraded.prepare(`SELECT status FROM deliveries WHERE id = 'delivery-v5'`).get().status,
@@ -130,6 +140,10 @@ test('current migrations preserve v5 deliveries, attempts, media, and operator a
     assert.equal(
       upgraded.prepare(`SELECT count(*) AS count FROM delivery_receipts`).get().count,
       0,
+    );
+    assert.equal(
+      upgraded.prepare(`SELECT name_source FROM topic_links WHERE zalo_thread_id = 'group-v5'`).get().name_source,
+      'legacy',
     );
     verifyDatabase(upgraded);
     closeBridgeDatabase(upgraded);

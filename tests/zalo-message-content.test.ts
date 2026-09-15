@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   resolveZaloLinkContent,
+  normalizeZaloPollOptions,
   resolveZaloPhotoContent,
+  resolveZaloFallbackDetail,
   resolveZaloTextBody,
 } from '../src/zalo/message-content.js';
 
@@ -65,4 +67,23 @@ test('Zalo photos fall back to description and reject empty media payloads', () 
     caption: 'Mô tả',
   });
   assert.equal(resolveZaloPhotoContent({ href: ' ', thumb: '' }), null);
+});
+
+test('malformed Zalo media retains a useful fallback detail', () => {
+  assert.equal(resolveZaloFallbackDetail({
+    title: ' ',
+    description: ' Nội dung xem trước ',
+    action: 'recommended.link',
+  }), 'Nội dung xem trước');
+  assert.equal(resolveZaloFallbackDetail({}), undefined);
+});
+
+test('Zalo poll options fit Telegram limits without empty choices', () => {
+  const options = normalizeZaloPollOptions([
+    { content: 'A'.repeat(101) },
+    { content: '   ' },
+  ]);
+  assert.equal(Array.from(options[0]!).length, 100);
+  assert.match(options[0]!, /…$/);
+  assert.equal(options[1], 'Lựa chọn 2');
 });

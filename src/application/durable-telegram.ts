@@ -19,6 +19,10 @@ interface DeliveryExecutionState {
   repository: DeliveryRepository;
   workerId: string;
   attemptNo: number;
+  skipped?: {
+    code: string;
+    message: string;
+  };
 }
 
 export interface TelegramDeliveryTarget {
@@ -87,6 +91,15 @@ export function markDurableTelegramHandled(): void {
 export function recordDurableTelegramFailure(error: unknown): void {
   const state = executionStorage.getStore();
   if (state && state.failure === undefined) state.failure = error;
+}
+
+export function recordDurableTelegramSkipped(code: string, message: string): void {
+  const state = executionStorage.getStore();
+  const normalizedCode = code.trim();
+  const normalizedMessage = message.trim();
+  if (state && normalizedCode && normalizedMessage && state.skipped === undefined) {
+    state.skipped = { code: normalizedCode, message: normalizedMessage };
+  }
 }
 
 export function recordDurableTelegramProviderMessageId(
@@ -332,7 +345,16 @@ export class DurableTelegramRelay {
 
     const now = Date.now();
     if (!state.failure && state.handled) {
-      this.#repository.markSent(delivery.id, this.#workerId, now);
+      if (state.skipped) {
+        this.#repository.markSkipped(
+          delivery.id,
+          this.#workerId,
+          now,
+          state.skipped,
+        );
+      } else {
+        this.#repository.markSent(delivery.id, this.#workerId, now);
+      }
       return;
     }
 

@@ -5,6 +5,7 @@ import { mediaSpoolMigration } from './004-media-spool.js';
 import { deliveryOperationsMigration } from './005-delivery-operations.js';
 import { deliveryReceiptsMigration } from './006-delivery-receipts.js';
 import { telegramMultipartMigration } from './007-telegram-multipart.js';
+import { topicNameProvenanceMigration } from './008-topic-name-provenance.js';
 import type { Migration } from './types.js';
 
 export const migrations: readonly Migration[] = [
@@ -15,4 +16,5 @@ export const migrations: readonly Migration[] = [
   deliveryOperationsMigration,
   deliveryReceiptsMigration,
   telegramMultipartMigration,
+  topicNameProvenanceMigration,
 ];

@@ -7,8 +7,7 @@ import { tgBot, syncTelegramCommands } from './telegram/bot.js';
 import { setupTelegramHandler, type TelegramHandlerHandle } from './telegram/handler.js';
 import { config } from './config.js';
 import { startUpdateChecker, type UpdateCheckerHandle } from './updater.js';
-import { store, flushMsgStore } from './store/index.js';
-import { runZaloRequest } from './zalo/rate-limit.js';
+import { flushMsgStore } from './store/index.js';
 import { runtimeHealth } from './runtime/health.js';
 import {
   closeBridgeDatabase,
@@ -37,6 +36,9 @@ import { installConsoleRedaction } from './runtime/redacted-console.js';
 import { verifyTelegramDeployment } from './telegram/deployment-preflight.js';
 import { clearBridgeMappings } from './application/clear-mappings.js';
 import type { MappingClearPreparation } from './telegram/types.js';
+import { reconcileGroupTopics } from './zalo/topic-reconciliation.js';
+import { requestRecentHistoryReplay } from './zalo/history.js';
+import { waitForZaloListenerConnection } from './zalo/listener-lifecycle.js';
 
 installConsoleRedaction([config.telegram.token]);
 
@@ -52,9 +54,12 @@ let instanceLease: SqliteInstanceLease | null = null;
 let telegramHandler: TelegramHandlerHandle | null = null;
 let durableZaloRelay: DurableZaloRelay | null = null;
 let mediaMaintenanceTimer: ReturnType<typeof setInterval> | null = null;
+let topicReconciliationTimer: ReturnType<typeof setInterval> | null = null;
+let topicReconciliationRunning = false;
 let mappingClearReserved = false;
 
 const MEDIA_MAINTENANCE_INTERVAL_MS = 60 * 60_000;
+const TOPIC_RECONCILIATION_INTERVAL_MS = 30 * 60_000;
 
 const startedZaloListeners = new WeakSet<object>();
 const wiredDisconnectHandlers = new WeakSet<object>();
@@ -69,6 +74,38 @@ function clearMediaMaintenanceTimer(): void {
   if (!mediaMaintenanceTimer) return;
   clearInterval(mediaMaintenanceTimer);
   mediaMaintenanceTimer = null;
+}
+
+function clearTopicReconciliationTimer(): void {
+  if (!topicReconciliationTimer) return;
+  clearInterval(topicReconciliationTimer);
+  topicReconciliationTimer = null;
+}
+
+async function runTopicReconciliation(api: ZaloAPI, pruneMissing: boolean): Promise<void> {
+  if (topicReconciliationRunning || shuttingDown || api !== activeZaloApi) return;
+  topicReconciliationRunning = true;
+  try {
+    const result = await reconcileGroupTopics(api, { pruneMissing });
+    console.log(
+      `[Boot] Topic reconciliation: ${result.renamed} renamed, `
+      + `${result.provenanceUpdated} provenance updated, ${result.pruned} pruned, `
+      + `${result.missingMetadata} missing metadata, ${result.failed} failed.`,
+    );
+  } catch (error) {
+    console.warn('[Boot] Topic reconciliation deferred:', error);
+  } finally {
+    topicReconciliationRunning = false;
+  }
+}
+
+function startTopicReconciliationTimer(): void {
+  if (topicReconciliationTimer) return;
+  topicReconciliationTimer = setInterval(() => {
+    const api = activeZaloApi;
+    if (api) void runTopicReconciliation(api, false);
+  }, TOPIC_RECONCILIATION_INTERVAL_MS);
+  topicReconciliationTimer.unref();
 }
 
 function startMediaMaintenance(
@@ -154,6 +191,7 @@ async function shutdown(
   console.log(`\n[Boot] Received ${signal}, shutting down...`);
   clearReconnectTimer();
   clearMediaMaintenanceTimer();
+  clearTopicReconciliationTimer();
   updateChecker?.stop();
   const apiAtShutdown = activeZaloApi;
   telegramHandler?.clearApi(apiAtShutdown ?? undefined);
@@ -265,30 +303,6 @@ process.on('uncaughtException', (err) => {
 process.once('SIGINT',  () => { void shutdown('SIGINT'); });
 process.once('SIGTERM', () => { void shutdown('SIGTERM'); });
 
-async function pruneLeftGroupTopics(api: ZaloAPI): Promise<void> {
-  try {
-    const groups = await runZaloRequest(
-      { label: 'getAllGroups(pruneLeftGroupTopics)', priority: 'low', maxRetries: 0 },
-      () => api.getAllGroups(),
-    ) as { gridVerMap?: Record<string, string> } | undefined;
-    const activeGroupIds = new Set(Object.keys(groups?.gridVerMap ?? {}));
-    const removed: string[] = [];
-
-    for (const entry of store.all()) {
-      if (entry.type === 1 && !activeGroupIds.has(entry.zaloId)) {
-        store.remove(entry.topicId);
-        removed.push(`${entry.name} (${entry.zaloId})`);
-      }
-    }
-
-    if (removed.length > 0) {
-      console.log(`[Boot] Pruned ${removed.length} stale group topic(s): ${removed.join(', ')}`);
-    }
-  } catch (err) {
-    console.warn('[Boot] Could not prune stale group topics:', err);
-  }
-}
-
 function scheduleZaloReconnect(delayMs = reconnectDelayMs, notifyTelegram = true): void {
   if (shuttingDown || reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
@@ -354,15 +368,7 @@ async function startZalo(api: ZaloAPI, isReconnect = false): Promise<void> {
   durableZaloRelay?.setApi(api);
   setZaloApiRef?.(api);
 
-  if (!isReconnect) void pruneLeftGroupTopics(api);
   await setupZaloHandler(api, durableZaloRelay ?? undefined);
-
-  if (!startedZaloListeners.has(api as object)) {
-    api.listener.start();
-    startedZaloListeners.add(api as object);
-  }
-  console.log(`[Boot] Zalo listener ${isReconnect ? 're' : ''}started ✓`);
-  runtimeHealth.set('zalo', 'ready');
 
   if (!wiredDisconnectHandlers.has(api as object)) {
     wiredDisconnectHandlers.add(api as object);
@@ -390,6 +396,23 @@ async function startZalo(api: ZaloAPI, isReconnect = false): Promise<void> {
       scheduleZaloReconnect();
     });
   }
+
+  runtimeHealth.set('zalo', 'starting');
+  if (!startedZaloListeners.has(api as object)) {
+    api.listener.start();
+    startedZaloListeners.add(api as object);
+    await waitForZaloListenerConnection(api);
+  }
+  console.log(`[Boot] Zalo listener ${isReconnect ? 're' : ''}started ✓`);
+  runtimeHealth.set('zalo', 'ready');
+  try {
+    requestRecentHistoryReplay(api);
+    console.log('[Boot] Requested recent Zalo history replay after connection ✓');
+  } catch (error) {
+    console.warn('[Boot] Could not request recent Zalo history replay:', error);
+  }
+  void runTopicReconciliation(api, !isReconnect);
+  startTopicReconciliationTimer();
 }
 
 async function main(): Promise<void> {
@@ -506,9 +529,11 @@ async function main(): Promise<void> {
       await stopZaloListener(failedApi);
       console.warn('[Boot] Zalo auto-login failed:', err);
       runtimeHealth.set('zalo', 'degraded');
+      scheduleZaloReconnect(reconnectDelayMs);
       return tgBot.telegram.sendMessage(
         config.telegram.groupId,
-        'Chưa đăng nhập Zalo. Gửi <b>/login</b> để đăng nhập.',
+        `Chưa kết nối được Zalo. Bridge sẽ tự thử lại sau ${Math.round(reconnectDelayMs / 1_000)} giây. `
+          + 'Gửi <b>/login</b> nếu phiên đã hết hạn.',
         { parse_mode: 'HTML' },
       ).catch(() => undefined);
     });

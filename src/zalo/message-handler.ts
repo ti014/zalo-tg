@@ -24,10 +24,8 @@ import {
 } from '../utils/format.js';
 import {
   buildScoreText,
-  getCachedGroupInfo,
   parseBankCardHtml,
   parseContent,
-  refreshCachedGroupInfo,
   resolveUserDisplayName,
   canRetryMemberCache,
   ensureGroupMemberCache,
@@ -39,7 +37,13 @@ import {
   isStrangerZaloUser,
 } from './conversation-policy.js';
 import { runZaloRequest } from './rate-limit.js';
-import { getOrCreateTopic, isTopicDeletedError, sendWithTopicRecovery } from './topic.js';
+import {
+  getOrCreateTopic,
+  isTopicDeletedError,
+  resolveGroupTopicPresentation,
+  sendWithTopicRecovery,
+  type TopicPresentation,
+} from './topic.js';
 import { normalizeMessageId, normalizeMessageIds } from '../domain/message-id.js';
 import { contentFingerprint, type PendingSendKind } from '../domain/pending-sends.js';
 import { resolveTelegramReplyTarget } from '../domain/zalo-reply.js';
@@ -64,13 +68,16 @@ import { lookupShadowSentTelegramId } from '../infrastructure/database/shadow-st
 import { isAmbiguousProviderFailure } from '../domain/provider-errors.js';
 import {
   resolveZaloLinkContent,
+  normalizeZaloPollOptions,
   resolveZaloPhotoContent,
+  resolveZaloFallbackDetail,
   resolveZaloTextBody,
 } from './message-content.js';
 import { maybeAutoReply } from './auto-reply.js';
 import { parseDeletedZaloMessages, parseEcard, parseMissedCall } from './system-events.js';
 import {
   sendTelegramAnimationWithFallback,
+  sendTelegramPhotoWithFallback,
   telegramDocumentInput,
   telegramMediaInput,
   withTelegramMediaFallback,
@@ -84,12 +91,17 @@ function sendTelegramPhotoFile(
   options: Parameters<typeof tg.sendPhoto>[2],
   label = 'Photo upload',
 ) {
-  return withTelegramMediaFallback(
-    forceMultipart => tg.sendPhoto(
-      config.telegram.groupId,
-      telegramMediaInput(filePath, forceMultipart),
-      options,
-    ),
+  return sendTelegramPhotoWithFallback<{ message_id: number }>(
+    filePath,
+    path.basename(filePath),
+    {
+      photo: media => tg.sendPhoto(config.telegram.groupId, media, options),
+      document: media => tg.sendDocument(
+        config.telegram.groupId,
+        media,
+        options as Parameters<typeof tg.sendDocument>[2],
+      ),
+    },
     label,
   );
 }
@@ -133,12 +145,6 @@ function sendTelegramAnimationFile(
       ),
     },
   );
-}
-
-function recordInvalidSourcePayload(message: string): void {
-  recordDurableZaloFailure(Object.assign(new Error(message), {
-    code: 'INVALID_SOURCE_PAYLOAD',
-  }));
 }
 
 function markMessageInFlight(msgId: string): void {
@@ -358,17 +364,15 @@ export async function handleZaloMessage(
         else userCache.save(senderUid, senderName);
       }
 
-      let displayName = senderName;
-      let groupAvatarUrl: string | undefined;
-      if (type === ThreadType.Group) {
-        const info = getCachedGroupInfo(zaloId) ?? await refreshCachedGroupInfo(api, zaloId);
-        displayName = info?.name || senderName;
-        groupAvatarUrl = info?.avt;
-      } else {
-        displayName = await resolveUserDisplayName(api, zaloId, providerSenderName);
-      }
+      const topicPresentation: TopicPresentation = type === ThreadType.Group
+        ? await resolveGroupTopicPresentation(api, zaloId)
+        : {
+            name: await resolveUserDisplayName(api, zaloId, providerSenderName),
+            nameSource: 'contact',
+          };
+      const displayName = topicPresentation.name;
 
-      const topicId = await getOrCreateTopic(zaloId, type, displayName, groupAvatarUrl);
+      const topicId = await getOrCreateTopic(zaloId, type, topicPresentation);
 
       let tgReplyMsgId: number | undefined;
       if (msg.data.quote) {
@@ -424,6 +428,16 @@ export async function handleZaloMessage(
       const saveTgMapping = (sent: { message_id: number }) => {
         recordDurableZaloProviderMessageId(sent.message_id);
         saveTgMappingOnly(sent);
+      };
+      const sendPayloadFallback = async (kind: string): Promise<void> => {
+        const detail = resolveZaloFallbackDetail(media);
+        const sent = await tg.sendMessage(
+          config.telegram.groupId,
+          `${groupCaption(senderName)}\n<i>Không thể hiển thị đầy đủ ${escapeHtml(kind)} từ Zalo.</i>`
+            + (detail ? `\n${escapeHtml(detail)}` : ''),
+          { ...tgBase, parse_mode: 'HTML' },
+        );
+        saveTgMapping(sent);
       };
 
       const sendAsSplitDocumentsIfNeeded = async (
@@ -600,7 +614,7 @@ export async function handleZaloMessage(
       if (msgType === ZALO_MSG_TYPES.TEXT || (text !== null)) {
         const body = resolveZaloTextBody(text, msg.data.content, media);
         if (!body.trim()) {
-          recordInvalidSourcePayload('Zalo text message has no content.');
+          await sendPayloadFallback('tin nhắn');
           return;
         }
         const safeBody = truncate(body);
@@ -648,7 +662,7 @@ export async function handleZaloMessage(
         const photo = resolveZaloPhotoContent(media);
         if (!photo) {
           console.warn('[ZaloHandler] Photo: no URL found in content:', media);
-          recordInvalidSourcePayload('Zalo photo message has no media URL.');
+          await sendPayloadFallback('ảnh');
           return;
         }
 
@@ -660,8 +674,7 @@ export async function handleZaloMessage(
             const sent = await sendWithTopicRecovery(
               zaloId,
               type,
-              displayName,
-              groupAvatarUrl,
+              topicPresentation,
               topic => sendTelegramPhotoFile(
                 localPath,
                 {
@@ -701,8 +714,7 @@ export async function handleZaloMessage(
                   const sent = await sendWithTopicRecovery(
                     zaloId,
                     type,
-                    displayName,
-                    groupAvatarUrl,
+                    topicPresentation,
                     topic => sendTelegramPhotoFile(
                       localPath,
                       {
@@ -745,8 +757,7 @@ export async function handleZaloMessage(
                     const sentMsgs = await sendWithTopicRecovery(
                       zaloId,
                       type,
-                      displayName,
-                      groupAvatarUrl,
+                      topicPresentation,
                       topic => batch.length === 1
                         ? sendTelegramPhotoFile(
                             batch[0]!,
@@ -794,7 +805,7 @@ export async function handleZaloMessage(
         const url = media.href || media.thumb;
         if (!url) {
           console.warn('[ZaloHandler] Doodle: no URL');
-          recordInvalidSourcePayload('Zalo doodle message has no media URL.');
+          await sendPayloadFallback('hình vẽ');
           return;
         }
         const localPath = await downloadZaloMediaDurably(url, `doodle_${Date.now()}.jpg`);
@@ -810,7 +821,7 @@ export async function handleZaloMessage(
           .filter((value): value is string => typeof value === 'string' && value.trim().length > 0);
         if (urls.length === 0) {
           console.warn('[ZaloHandler] GIF: no URL found in content:', media);
-          recordInvalidSourcePayload('Zalo GIF message has no media URL.');
+          await sendPayloadFallback('GIF');
           return;
         }
         const ext = path.extname(urls[0]!.split('?')[0] ?? '').toLowerCase() || '.mp4';
@@ -828,10 +839,19 @@ export async function handleZaloMessage(
         const fileName = media.title ?? `file_${Date.now()}`;
         if (!url) {
           console.warn('[ZaloHandler] File: no URL found in content:', media);
-          recordInvalidSourcePayload('Zalo file message has no media URL.');
+          await sendPayloadFallback('tệp');
           return;
         }
-        const localPath = await (earlyDlPromise ?? downloadZaloMediaDurably(url, fileName));
+        let localPath: string;
+        try {
+          localPath = await (earlyDlPromise ?? downloadZaloMediaDurably(url, fileName));
+        } catch (error) {
+          if (String((error as { code?: unknown }).code ?? '') === 'MEDIA_TOO_LARGE') {
+            await sendPayloadFallback(`tệp ${fileName} vượt giới hạn tải`);
+            return;
+          }
+          throw error;
+        }
         try {
           if (await sendAsSplitDocumentsIfNeeded(localPath, fileName)) return;
           const sent = await sendTelegramDocumentFile(localPath, fileName, tgOpts);
@@ -846,7 +866,7 @@ export async function handleZaloMessage(
         const url = media.href;
         if (!url) {
           console.warn('[ZaloHandler] Video: no URL found in content:', media);
-          recordInvalidSourcePayload('Zalo video message has no media URL.');
+          await sendPayloadFallback('video');
           return;
         }
         const fileName = `video_${Date.now()}.mp4`;
@@ -870,7 +890,7 @@ export async function handleZaloMessage(
         const url = media.href;
         if (!url) {
           console.warn('[ZaloHandler] Voice: no URL found in content:', media);
-          recordInvalidSourcePayload('Zalo voice message has no media URL.');
+          await sendPayloadFallback('tin nhắn thoại');
           return;
         }
         const ext = path.extname(url.split('?')[0] ?? '').toLowerCase() || '.m4a';
@@ -895,7 +915,7 @@ export async function handleZaloMessage(
         const stickerId = media.id;
         if (!stickerId) {
           console.warn('[ZaloHandler] Sticker: no id in content:', media);
-          recordInvalidSourcePayload('Zalo sticker message has no sticker ID.');
+          await sendPayloadFallback('sticker');
           return;
         }
         try {
@@ -1028,7 +1048,7 @@ export async function handleZaloMessage(
         }
         const link = resolveZaloLinkContent(media);
         if (!link) {
-          recordInvalidSourcePayload('Zalo link message has no URL.');
+          await sendPayloadFallback('link preview');
           return;
         }
         const { href, title } = link;
@@ -1240,7 +1260,7 @@ export async function handleZaloMessage(
         console.log(`[ZaloHandler] Poll event: action="${action}" pollId=${pollId}`);
 
         if (!pollId) {
-          recordInvalidSourcePayload('Zalo poll message has no poll ID.');
+          await sendPayloadFallback('bình chọn');
           return;
         }
 
@@ -1274,7 +1294,7 @@ export async function handleZaloMessage(
           const tgPollMsg = await tg.sendPoll(
             config.telegram.groupId,
             question,
-            options.map(o => o.content),
+            normalizeZaloPollOptions(options),
             {
               ...tgBase,
               is_anonymous:        isAnonymous,

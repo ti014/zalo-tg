@@ -165,6 +165,10 @@ export const groupsCache = {
       .slice(0, limit);
   },
 
+  get(groupId: string): ZaloGroup | undefined {
+    return _groups.find(group => group.groupId === groupId);
+  },
+
   isFresh(): boolean {
     return _groups.length > 0 && Date.now() - _groupsTs < GROUPS_TTL_MS;
   },
