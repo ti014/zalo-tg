@@ -72,6 +72,7 @@ import {
   resolveZaloPhotoContent,
   resolveZaloFallbackDetail,
   resolveZaloTextBody,
+  telegramPhotoCaption,
 } from './message-content.js';
 import { maybeAutoReply } from './auto-reply.js';
 import { parseDeletedZaloMessages, parseEcard, parseMissedCall } from './system-events.js';
@@ -669,7 +670,17 @@ export async function handleZaloMessage(
         const albumKey = `${zaloId}:${senderUid}`;
 
         if (isDurableZaloDelivery()) {
-          const localPath = await downloadZaloMediaDurably(photo.urls, `photo_${Date.now()}.jpg`);
+          let localPath: string;
+          try {
+            localPath = await downloadZaloMediaDurably(photo.urls, `photo_${Date.now()}.jpg`);
+          } catch (error) {
+            if (String((error as { code?: unknown }).code ?? '') === 'MEDIA_UNAVAILABLE') {
+              await sendPayloadFallback('ảnh (file gốc đã hết hạn)');
+              return;
+            }
+            throw error;
+          }
+          const photoText = telegramPhotoCaption(senderName, photo.caption);
           try {
             const sent = await sendWithTopicRecovery(
               zaloId,
@@ -681,14 +692,21 @@ export async function handleZaloMessage(
                   ...tgBase,
                   message_thread_id: topic,
                   parse_mode: 'HTML' as const,
-                  caption: photo.caption
-                    ? `${groupCaption(senderName)}\n${escapeHtml(photo.caption)}`
-                    : groupCaption(senderName),
+                  caption: photoText.caption,
                 },
               ),
               topicId,
             );
             saveTgMapping(sent);
+            for (const [ordinal, text] of photoText.text.entries()) {
+              const extra = await tg.sendMessage(config.telegram.groupId, text, {
+                ...tgBase,
+                message_thread_id: store.getTopicByZalo(zaloId, type) ?? topicId,
+              });
+              recordDurableZaloProviderMessageId(extra.message_id, {
+                receiptKind: 'auxiliary', ordinal, isPrimary: false,
+              });
+            }
           } finally {
             await cleanTemp(localPath);
           }

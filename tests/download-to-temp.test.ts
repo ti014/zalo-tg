@@ -72,7 +72,7 @@ test('candidate download falls back from an expired HD URL to the normal photo U
   const requested: string[] = [];
   const server = http.createServer((request, response) => {
     requested.push(request.url ?? '');
-    if (request.url === '/hd') {
+    if (request.url === '/hd' || request.url === '/gone') {
       response.writeHead(404).end('expired');
       return;
     }
@@ -89,8 +89,16 @@ test('candidate download falls back from an expired HD URL to the normal photo U
     downloaded = await downloadToTempFromCandidates([
       `http://127.0.0.1:${address.port}/hd`,
       `http://127.0.0.1:${address.port}/normal`,
-    ], 'ảnh mùa hè.jpg', 1, 100);
+    ], 'ảnh mùa hè.jpg', 3, 100);
     assert.deepEqual(requested, ['/hd', '/normal']);
+    await assert.rejects(downloadToTempFromCandidates([
+      `http://127.0.0.1:${address.port}/hd`,
+      `http://127.0.0.1:${address.port}/gone`,
+    ], 'gone.jpg', 3), (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'MEDIA_UNAVAILABLE');
+      return true;
+    });
+    assert.deepEqual(requested, ['/hd', '/normal', '/hd', '/gone']);
   } finally {
     if (downloaded) await cleanTemp(downloaded);
     await new Promise<void>(resolve => server.close(() => resolve()));

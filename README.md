@@ -153,7 +153,7 @@ Startup validates configuration, opens SQLite, applies checksummed migrations, i
 
 - SQLite is the recovery source for topic/message links, aliases, settings, delivery attempts, receipts, media objects, and operator actions.
 - Delivery states are `READY`, `SENDING`, `RETRY`, `SENT`, `SKIPPED`, `UNKNOWN`, and `PERMANENT_FAILED`.
-- The bridge is **at least once**, not exactly once. A request that may have reached a provider before a crash becomes `UNKNOWN` rather than being blindly replayed.
+- The bridge is **at least once**, not exactly once. Zalo → Telegram transport resets/timeouts retry with capped backoff, even beyond the general attempt budget; duplicates are possible. Provider receipts, partial multipart sends, storage failures, and expired crash leases remain `UNKNOWN` for reconciliation. Telegram → Zalo ambiguous sends also remain `UNKNOWN`.
 - FIFO ordering is preserved per conversation. Use `/queue` to inspect queued, retrying, and uncertain deliveries.
 - Legacy `topics.json`, `settings.json`, and `msg-map.json` are imported and can be atomically rehydrated from SQLite.
 

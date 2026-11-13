@@ -158,7 +158,7 @@ Startup validate config, mở SQLite, chạy migration có checksum, import lega
 
 - SQLite là recovery source cho topic/message link, alias, setting, delivery attempt, receipt, media object và operator action.
 - Delivery state là `READY`, `SENDING`, `RETRY`, `SENT`, `SKIPPED`, `UNKNOWN` và `PERMANENT_FAILED`.
-- Bridge có ngữ nghĩa **at least once**, không phải exactly once. Request có thể đã đến provider trước khi crash sẽ thành `UNKNOWN`, thay vì được replay mù.
+- Bridge có ngữ nghĩa **at least once**, không phải exactly once. Lỗi mạng/reset/timeout chiều Zalo → Telegram tự retry với backoff tối đa 5 phút, không giới hạn số lần; có thể gửi trùng. Trường hợp có receipt, multipart chưa rõ kết quả, lỗi ghi dữ liệu hoặc lease hết hạn sau crash vẫn thành `UNKNOWN` để đối soát. Chiều Telegram → Zalo vẫn giữ `UNKNOWN` khi chưa rõ kết quả gửi.
 - FIFO được giữ theo từng conversation. Dùng `/queue` để kiểm tra delivery đang queue, retry hoặc chưa chắc chắn.
 - `topics.json`, `settings.json` và `msg-map.json` legacy được import, sau đó có thể hydrate atomically từ SQLite.
 

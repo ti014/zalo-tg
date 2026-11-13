@@ -368,12 +368,23 @@ test('delivery failures transition to retry, unknown, permanent failure, or DLQ'
   assert.equal(retry.status, 'RETRY');
   assert.equal(retry.lastErrorCode, 'EAGAIN');
 
-  const unknown = await observeFailureStatus({
-    handled: true,
-    failure: Object.assign(new Error('socket timed out'), { code: 'ETIMEDOUT' }),
-  });
-  assert.equal(unknown.status, 'UNKNOWN');
-  assert.equal(unknown.lastErrorCode, 'ETIMEDOUT');
+  for (const failure of [
+    Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }),
+    Object.assign(new Error('socket timed out'), { code: 'ETIMEDOUT' }),
+    new Error('network timeout at: https://api.telegram.org/sendVideo'),
+  ]) {
+    const retry = await observeFailureStatus({ handled: true, failure, maxAttempts: 1 });
+    assert.equal(retry.status, 'RETRY');
+    assert.ok(retry.nextAttemptAt > retry.updatedAt);
+  }
+
+  for (const code of ['RECEIPT_WRITE_FAILED', 'SHADOW_WRITE_FAILED', 'PARTIAL_CHUNK_UPLOAD', 'MULTIPART_PART_UNKNOWN']) {
+    const unknown = await observeFailureStatus({
+      handled: true,
+      failure: Object.assign(new Error('network timeout after partial send'), { code }),
+    });
+    assert.equal(unknown.status, 'UNKNOWN');
+  }
 
   const connectTimeout = await observeFailureStatus({
     handled: true,
@@ -418,6 +429,74 @@ test('delivery failures transition to retry, unknown, permanent failure, or DLQ'
   });
   assert.equal(dlq.status, 'DLQ');
   assert.equal(dlq.lastErrorCode, 'MAX_ATTEMPTS');
+});
+
+test('transport retries preserve FIFO and resume after a simulated restart', async () => {
+  await withRepository(async (repository, db) => {
+    const first = zaloMessage('network-1');
+    const second = zaloMessage('network-2');
+    const processed: string[] = [];
+    const relay = new DurableZaloRelay({
+      repository,
+      processMessage: async (_api, message) => {
+        markDurableZaloHandled();
+        processed.push(message.data.msgId);
+        throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+      },
+      onFatal: error => assert.fail(error),
+      maxAttempts: 1,
+    });
+    relay.enqueue(first);
+    relay.enqueue(second);
+    relay.setApi(api);
+    await waitFor(() => findDelivery(repository, db, first).status === 'RETRY', 'transport retry');
+    await relay.stop();
+    assert.deepEqual(processed, ['network-1']);
+    assert.equal(findDelivery(repository, db, second).status, 'READY');
+    db.prepare("UPDATE deliveries SET next_attempt_at = 0 WHERE status = 'RETRY'").run();
+    const restarted = new DurableZaloRelay({
+      repository,
+      processMessage: async (_api, message) => {
+        markDurableZaloHandled();
+        processed.push(message.data.msgId);
+      },
+      onFatal: error => assert.fail(error),
+      maxAttempts: 1,
+    });
+    try {
+      restarted.setApi(api);
+      await waitFor(() => findDelivery(repository, db, second).status === 'SENT', 'FIFO recovery');
+      assert.deepEqual(processed, ['network-1', 'network-1', 'network-2']);
+    } finally { await restarted.stop(); }
+  });
+});
+
+test('receipts from an earlier attempt prevent blind transport replay', async () => {
+  await withRepository(async (repository, db) => {
+    const message = zaloMessage('receipt-failure');
+    let calls = 0;
+    const relay = new DurableZaloRelay({
+      repository,
+      processMessage: async () => {
+        markDurableZaloHandled();
+        calls += 1;
+        if (calls === 1) recordDurableZaloProviderMessageId(987655);
+        throw Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+      },
+      onFatal: error => assert.fail(error),
+    });
+    try {
+      relay.enqueue(message);
+      relay.setApi(api);
+      await waitFor(() => findDelivery(repository, db, message).status === 'UNKNOWN', 'receipt hold');
+      const first = findDelivery(repository, db, message);
+      repository.requeueProblem(first.id);
+      relay.wake();
+      await waitFor(() => findDelivery(repository, db, message).attempts === 2
+        && findDelivery(repository, db, message).status === 'UNKNOWN', 'previous receipt hold');
+      assert.equal(repository.hasProviderReceipts(first.id), true);
+    } finally { await relay.stop(); }
+  });
 });
 
 test('stop waits for an in-flight delivery and leaves later FIFO work replayable', async () => {

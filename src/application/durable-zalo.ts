@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 
 import { normalizeMessageId } from '../domain/message-id.js';
-import { isConnectPhaseFailure } from '../domain/provider-errors.js';
+import { isAmbiguousProviderFailure, isConnectPhaseFailure } from '../domain/provider-errors.js';
 import type {
   DeliveryRecord,
   DeliveryRepository,
@@ -160,18 +160,14 @@ function errorDetails(error: unknown): { code: string; message: string } {
   };
 }
 
-function isUncertain(error: unknown): boolean {
-  const { code, message } = errorDetails(error);
+function requiresReconciliation(error: unknown): boolean {
+  const { code } = errorDetails(error);
   return [
-    'ETIMEDOUT',
-    'ESOCKETTIMEDOUT',
-    'ECONNRESET',
-    'EPIPE',
     'PARTIAL_CHUNK_UPLOAD',
+    'MULTIPART_PART_UNKNOWN',
     'RECEIPT_WRITE_FAILED',
     'SHADOW_WRITE_FAILED',
-  ].includes(code)
-    || /timeout|timed out|socket hang up/i.test(message);
+  ].includes(code);
 }
 
 function isPermanent(error: unknown): boolean {
@@ -181,6 +177,7 @@ function isPermanent(error: unknown): boolean {
     '403',
     '413',
     'MEDIA_TOO_LARGE',
+    'MEDIA_UNAVAILABLE',
     'INVALID_PAYLOAD',
     'INVALID_SOURCE_PAYLOAD',
     'PART_MANIFEST_MISMATCH',
@@ -405,16 +402,21 @@ export class DurableZaloRelay {
     }
     const failure = state.failure ?? new Error('Zalo message was not handled by the Telegram relay.');
     const details = errorDetails(failure);
-    if (this.#repository.hasProviderReceipts(delivery.id, delivery.attempts)) {
+    if (
+      this.#repository.hasProviderReceipts(delivery.id)
+      || requiresReconciliation(failure)
+      || this.#repository.listTelegramMultipartParts(delivery.id)
+        .some(part => part.status === 'UNKNOWN' || part.status === 'SENDING')
+    ) {
       this.#repository.markUnknown(delivery.id, this.#workerId, now, details);
     } else if (!state.handled || isPermanent(failure)) {
       this.#repository.markPermanentFailed(delivery.id, this.#workerId, now, details);
       this.#mediaSpool?.detachAllFromDelivery(delivery.id);
-    } else if (isConnectPhaseFailure(failure)) {
-      // Provider never saw it; outages must not exhaust attempts into a non-blocking DLQ.
-      this.#repository.markRetry(delivery.id, this.#workerId, now, details);
-    } else if (isUncertain(failure)) {
-      this.#repository.markUnknown(delivery.id, this.#workerId, now, details);
+    } else if (isConnectPhaseFailure(failure) || isAmbiguousProviderFailure(failure)) {
+      // Owner prioritizes eventual delivery: transport retries may duplicate, but never bypass FIFO via DLQ.
+      const retry = this.#repository.markRetry(delivery.id, this.#workerId, now, details);
+      console.warn(`[Zalo→TG] Transport retry: delivery=${delivery.id} attempt=${delivery.attempts} `
+        + `code=${details.code} next=${new Date(retry.nextAttemptAt).toISOString()}; duplicate possible.`);
     } else if (delivery.attempts >= this.#maxAttempts) {
       this.#repository.markDlq(delivery.id, this.#workerId, now, {
         code: 'MAX_ATTEMPTS',

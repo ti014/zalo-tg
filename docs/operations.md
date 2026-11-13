@@ -232,7 +232,13 @@ Telegram/SQLite khi Zalo trả metadata mới và ghi thống kê vào log
 `[Boot] Topic reconciliation`. Row legacy thuộc Telegram chat khác không bị sửa
 hoặc hydrate vào runtime hiện tại.
 
-`UNKNOWN` chặn các delivery đứng sau trong cùng conversation để giữ FIFO. Không retry mù vì có thể tạo tin nhắn trùng. Lỗi ở pha kết nối (ví dụ `connect ETIMEDOUT`, `connect ECONNREFUSED`) không thành `UNKNOWN` mà vào `RETRY` với backoff tối đa 5 phút và không tính giới hạn `maxAttempts`, vì request chưa rời máy nên provider chắc chắn chưa nhận; mất mạng kéo dài chỉ làm chậm, không đẩy tin sang `DLQ` (vốn không chặn FIFO nên sẽ làm lệch thứ tự). Nhánh fallback định dạng (ví dụ sticker sang photo) vẫn dừng ở lỗi này để không đổi định dạng chỉ vì mạng lỗi. Khi khởi động và mỗi giờ sau đó, bridge gửi vào `TG_GROUP_ID` danh sách delivery `UNKNOWN` mới, kèm tên topic và lệnh `/queue detail <delivery-id>`, để operator không bỏ sót conversation bị chặn. Quy trình reconciliation (đối soát) là:
+`UNKNOWN` chặn các delivery đứng sau trong cùng conversation để giữ FIFO.
+
+Chính sách được owner chọn ngày 2026-11-13: chiều **Zalo → Telegram** ưu tiên chuyển tiếp cuối cùng hơn tránh mọi tin trùng. Lỗi transport như `read ECONNRESET`, `EPIPE`, `ETIMEDOUT` và network timeout chuyển `RETRY` với backoff tối đa 5 phút, không áp dụng giới hạn `maxAttempts`. Ví dụ Telegram đã nhận tin nhưng phản hồi bị reset: bridge sẽ gửi lại và có thể xuất hiện hai bản. Log `[Zalo→TG] Transport retry` ghi delivery ID, attempt và thời điểm thử tiếp. Topic không bị đẩy qua `DLQ` chỉ vì mất mạng kéo dài.
+
+Không tự replay nếu delivery có receipt từ bất kỳ attempt nào, multipart part còn `UNKNOWN`/`SENDING`, hoặc lỗi `PARTIAL_CHUNK_UPLOAD`, `MULTIPART_PART_UNKNOWN`, `RECEIPT_WRITE_FAILED`, `SHADOW_WRITE_FAILED`: các trường hợp này vẫn vào `UNKNOWN` để tránh gửi lại toàn bộ một thao tác đã thực hiện một phần. Lease hết hạn sau crash và lỗi mơ hồ chiều Telegram → Zalo cũng vẫn cần đối soát. Lỗi connect chưa tới provider được retry ở cả hai chiều.
+
+Nhánh fallback định dạng (ví dụ sticker sang photo) vẫn dừng ở lỗi transport để không đổi định dạng chỉ vì mạng lỗi. Khi khởi động và mỗi giờ sau đó, bridge gửi vào `TG_GROUP_ID` danh sách delivery `UNKNOWN` mới, kèm tên topic và lệnh `/queue detail <delivery-id>`. Quy trình reconciliation (đối soát) là:
 
 1. Dùng thông tin conversation và thời điểm trong log để kiểm tra thủ công ở destination.
 2. Nếu tin nhắn đã xuất hiện, xác nhận đã gửi:
@@ -308,7 +314,7 @@ Ví dụ lựa chọn:
 - Zalo sang Telegram: file, GIF, video và voice vượt `TG_UPLOAD_PART_MB` (mặc định 45 MiB) được chia lossless thành `.part001`, `.part002`, ... rồi gửi tuần tự. Nếu Telegram chỉ nhận một phần, delivery chuyển `UNKNOWN` để operator đối soát thay vì tự gửi trùng.
 - Ảnh bị Telegram từ chối bằng `PHOTO_INVALID_DIMENSIONS` được gửi lại dưới dạng document; timeout mơ hồ không chạy fallback để tránh duplicate.
 - Poll option từ Zalo được cắt theo grapheme ở 100 ký tự. Payload Zalo malformed thiếu URL/nội dung tạo một notice trong topic thay vì biến mất im lặng. Telegram `forum_topic_edited` là service event và được audit thành `SKIPPED`, không phải delivery lỗi.
-- Timeout upload Telegram dùng `TG_UPLOAD_TIMEOUT_SEC` (mặc định 600 giây), tách khỏi timeout API thông thường 45 giây. Timeout không hủy chắc chắn request provider, nên kết quả vẫn đi vào `UNKNOWN`.
+- Timeout upload Telegram dùng `TG_UPLOAD_TIMEOUT_SEC` (mặc định 600 giây), tách khỏi timeout API thông thường 45 giây. Timeout không hủy chắc chắn request provider. Theo chính sách Zalo → Telegram, timeout không có receipt hay multipart chưa rõ kết quả sẽ được retry và có thể gửi trùng; trường hợp đã thực hiện một phần vẫn vào `UNKNOWN`.
 - Album ở production durable mode được chuyển từng item theo FIFO thay vì gom bằng debounce trong RAM. Cách này có thể làm mất giao diện album gộp, nhưng mỗi item có delivery/idempotency state riêng và sống qua restart tốt hơn.
 - GIF gửi sang Zalo được nén về ngưỡng an toàn 5.000.000 byte; nếu vẫn vượt ngưỡng sau các preset nén, delivery thất bại.
 - Media spool mặc định 200 MiB cho một object và 5 GiB tổng cộng. Có thể điều chỉnh bằng `MEDIA_MAX_OBJECT_MB` và `MEDIA_SPOOL_MAX_MB`; tổng quota phải lớn hơn hoặc bằng object quota. Chỉ tăng sau khi kiểm tra disk headroom và load test thực tế.

@@ -21,20 +21,19 @@ const _queue: QueueItem[] = [];
 let   _active    = 0;
 let   _pauseUntil = 0; // epoch ms — global back-off on 429
 
-function is429(err: unknown): number | null {
-  if (
-    err != null &&
-    typeof err === 'object' &&
-    'response' in err &&
-    (err as { response: { error_code?: number; parameters?: { retry_after?: number } } })
-      .response?.error_code === 429
-  ) {
-    return (
-      (err as { response: { parameters?: { retry_after?: number } } })
-        .response?.parameters?.retry_after ?? 30
-    );
-  }
-  return null;
+function retryAfterSeconds(err: unknown): number | null {
+  const response = (err as { response?: {
+    error_code?: number;
+    description?: string;
+    parameters?: { retry_after?: number };
+  } })?.response;
+  // Telegram sometimes wraps flood control in HTTP 400 instead of 429.
+  const wrapped = response?.error_code === 400
+    ? response.description?.match(/too many requests:\s*retry after (\d+)/i)
+    : undefined;
+  if (response?.error_code !== 429 && !wrapped) return null;
+  const seconds = response?.parameters?.retry_after ?? (wrapped ? Number(wrapped[1]) : 30);
+  return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : 30;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -69,7 +68,7 @@ async function runOne(item: QueueItem): Promise<void> {
     const result = await withTimeout(item.fn(), item.timeoutMs);
     item.resolve(result);
   } catch (err) {
-    const retryAfter = is429(err);
+    const retryAfter = retryAfterSeconds(err);
     if (retryAfter !== null && item.retries < MAX_RETRIES) {
       const delay = (retryAfter + 1) * 1000;
       console.warn(`[TGQueue] 429 — retry #${item.retries + 1} after ${retryAfter}s`);

@@ -369,6 +369,7 @@ export async function downloadToTemp(
     } catch (err) {
       await unlink(filePath).catch(() => undefined);
       if (err instanceof DownloadSizeLimitError) throw err;
+      if (axios.isAxiosError(err) && [404, 410].includes(err.response?.status ?? 0)) throw err;
       lastErr = err;
     }
   }
@@ -397,10 +398,14 @@ export async function downloadToTempFromCandidates(
       errors.push(error);
     }
   }
-  throw new AggregateError(
+  const failure = new AggregateError(
     errors,
     `Failed to download media from ${candidates.length} URL candidate(s).`,
   );
+  if (errors.every(error => axios.isAxiosError(error) && [404, 410].includes(error.response?.status ?? 0))) {
+    throw Object.assign(failure, { code: 'MEDIA_UNAVAILABLE' });
+  }
+  throw failure;
 }
 
 export interface SpriteSheetLayout {
