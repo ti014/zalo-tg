@@ -65,7 +65,7 @@ import {
   downloadZaloMediaDurably,
 } from '../application/durable-media.js';
 import { lookupShadowSentTelegramId } from '../infrastructure/database/shadow-state.js';
-import { isAmbiguousProviderFailure } from '../domain/provider-errors.js';
+import { isAmbiguousProviderFailure, isConnectPhaseFailure } from '../domain/provider-errors.js';
 import {
   resolveZaloLinkContent,
   normalizeZaloPollOptions,
@@ -568,7 +568,7 @@ export async function handleZaloMessage(
             } catch (error) {
               if (isDurableZaloDelivery()) {
                 const code = String((error as { code?: unknown }).code ?? '');
-                const ambiguous = isAmbiguousProviderFailure(error)
+                const ambiguous = (isAmbiguousProviderFailure(error) && !isConnectPhaseFailure(error))
                   || code === 'RECEIPT_WRITE_FAILED';
                 markDurableZaloMultipartPartFailure(
                   partNo,

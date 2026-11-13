@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 
 import { normalizeMessageId } from '../domain/message-id.js';
+import { isConnectPhaseFailure } from '../domain/provider-errors.js';
 import type {
   DeliveryRecord,
   DeliveryRepository,
@@ -409,6 +410,9 @@ export class DurableZaloRelay {
     } else if (!state.handled || isPermanent(failure)) {
       this.#repository.markPermanentFailed(delivery.id, this.#workerId, now, details);
       this.#mediaSpool?.detachAllFromDelivery(delivery.id);
+    } else if (isConnectPhaseFailure(failure)) {
+      // Provider never saw it; outages must not exhaust attempts into a non-blocking DLQ.
+      this.#repository.markRetry(delivery.id, this.#workerId, now, details);
     } else if (isUncertain(failure)) {
       this.#repository.markUnknown(delivery.id, this.#workerId, now, details);
     } else if (delivery.attempts >= this.#maxAttempts) {

@@ -232,7 +232,7 @@ Telegram/SQLite khi Zalo trả metadata mới và ghi thống kê vào log
 `[Boot] Topic reconciliation`. Row legacy thuộc Telegram chat khác không bị sửa
 hoặc hydrate vào runtime hiện tại.
 
-`UNKNOWN` chặn các delivery đứng sau trong cùng conversation để giữ FIFO. Không retry mù vì có thể tạo tin nhắn trùng. Quy trình reconciliation (đối soát) là:
+`UNKNOWN` chặn các delivery đứng sau trong cùng conversation để giữ FIFO. Không retry mù vì có thể tạo tin nhắn trùng. Lỗi ở pha kết nối (ví dụ `connect ETIMEDOUT`, `connect ECONNREFUSED`) không thành `UNKNOWN` mà vào `RETRY` với backoff tối đa 5 phút và không tính giới hạn `maxAttempts`, vì request chưa rời máy nên provider chắc chắn chưa nhận; mất mạng kéo dài chỉ làm chậm, không đẩy tin sang `DLQ` (vốn không chặn FIFO nên sẽ làm lệch thứ tự). Nhánh fallback định dạng (ví dụ sticker sang photo) vẫn dừng ở lỗi này để không đổi định dạng chỉ vì mạng lỗi. Khi khởi động và mỗi giờ sau đó, bridge gửi vào `TG_GROUP_ID` danh sách delivery `UNKNOWN` mới, kèm tên topic và lệnh `/queue detail <delivery-id>`, để operator không bỏ sót conversation bị chặn. Quy trình reconciliation (đối soát) là:
 
 1. Dùng thông tin conversation và thời điểm trong log để kiểm tra thủ công ở destination.
 2. Nếu tin nhắn đã xuất hiện, xác nhận đã gửi:

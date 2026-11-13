@@ -375,6 +375,15 @@ test('delivery failures transition to retry, unknown, permanent failure, or DLQ'
   assert.equal(unknown.status, 'UNKNOWN');
   assert.equal(unknown.lastErrorCode, 'ETIMEDOUT');
 
+  const connectTimeout = await observeFailureStatus({
+    handled: true,
+    failure: Object.assign(
+      new Error('request to https://api.telegram.org/sendPhoto failed, reason: connect ETIMEDOUT 149.154.166.110:443'),
+      { code: 'ETIMEDOUT' },
+    ),
+  });
+  assert.equal(connectTimeout.status, 'RETRY');
+
   const permanent = await observeFailureStatus({
     handled: true,
     failure: Object.assign(new Error('payload too large'), { code: 413 }),
