@@ -5,7 +5,7 @@ import {
   TELEGRAM_TO_ZALO_REACTION,
   ZALO_TO_TELEGRAM_REACTION,
 } from '../src/zalo/reaction.js';
-import { reactionEventDedupeStore } from '../src/store/reactions.js';
+import { reactionEventDedupeStore, reactionSummaryStore } from '../src/store/reactions.js';
 
 test('reaction target extraction uses cMsgID when Zalo mobile emits gMsgID zero', () => {
   assert.deepEqual(extractReactionTargetMsgIds({
@@ -36,6 +36,18 @@ test('reaction target extraction filters invalid IDs and supports legacy payload
 test('reaction mappings include native DM and tears-of-joy behavior', () => {
   assert.equal(ZALO_TO_TELEGRAM_REACTION['/-heart'], '❤');
   assert.equal(TELEGRAM_TO_ZALO_REACTION['😂'], ":')");
+});
+
+test('reaction action IDs preserve repeated taps and dedupe replayed events', () => {
+  const action = `reaction-action-${process.pid}-${Date.now()}`;
+  const input = { zaloId: 'group', targetMsgIds: ['m'], icon: '/-heart', actionId: action };
+  assert.equal(reactionEventDedupeStore.isDuplicateZaloInbound(input), false);
+  assert.equal(reactionEventDedupeStore.isDuplicateZaloInbound({ ...input, actionId: `${action}-2` }), false);
+  assert.equal(reactionEventDedupeStore.isDuplicateZaloInbound(input), true);
+  const entry = reactionSummaryStore.upsert(987654, '❤️', 'Alice');
+  reactionSummaryStore.upsert(987654, '❤️', 'Alice');
+  reactionSummaryStore.upsert(987654, '👍', 'Bob');
+  assert.equal(reactionSummaryStore.buildText(entry), '❤️ ×2 Alice  👍 Bob');
 });
 
 test('reaction event dedupe recognizes equivalent target ordering', () => {

@@ -1,7 +1,7 @@
 export interface ReactionSummaryEntry {
   summaryTgMsgId: number | null;
   lastSentText: string;
-  reactions: Record<string, string[]>;
+  reactions: Record<string, Record<string, number>>;
   debounceTimer: ReturnType<typeof setTimeout> | null;
 }
 
@@ -14,10 +14,8 @@ export const reactionSummaryStore = {
       entry = { summaryTgMsgId: null, lastSentText: '', reactions: {}, debounceTimer: null };
       _reactionSummaries.set(tgMsgId, entry);
     }
-    if (!entry.reactions[emoji]) entry.reactions[emoji] = [];
-    if (!entry.reactions[emoji]!.includes(actorName)) {
-      entry.reactions[emoji]!.push(actorName);
-    }
+    const actors = entry.reactions[emoji] ??= {};
+    actors[actorName] = (actors[actorName] ?? 0) + 1;
     return entry;
   },
 
@@ -28,8 +26,8 @@ export const reactionSummaryStore = {
 
   buildText(entry: ReactionSummaryEntry): string {
     return Object.entries(entry.reactions)
-      .filter(([, names]) => names.length > 0)
-      .map(([emoji, names]) => `${emoji} ${names.join(', ')}`)
+      .flatMap(([emoji, actors]) => Object.entries(actors)
+        .map(([name, count]) => count > 1 ? `${emoji} ×${count} ${name}` : `${emoji} ${name}`))
       .join('  ');
   },
 
@@ -87,6 +85,19 @@ export const reactionEchoStore = {
   },
 };
 
+const REACTION_ACTION_DEDUPE_MAX = 50_000;
+const _seenReactionActions = new Set<string>();
+
+function markReactionAction(actionId: string): boolean {
+  if (_seenReactionActions.has(actionId)) return true;
+  if (_seenReactionActions.size >= REACTION_ACTION_DEDUPE_MAX) {
+    const oldest = _seenReactionActions.values().next().value as string | undefined;
+    if (oldest) _seenReactionActions.delete(oldest);
+  }
+  _seenReactionActions.add(actionId);
+  return false;
+}
+
 const REACTION_EVENT_DEDUPE_TTL_MS = 15_000;
 const REACTION_EVENT_DEDUPE_MAX = 20_000;
 const _recentReactionEvents = new Map<string, number>();
@@ -126,7 +137,9 @@ export const reactionEventDedupeStore = {
     icon: string;
     actorUid?: string;
     actorName?: string;
+    actionId?: string;
   }): boolean {
+    if (input.actionId?.trim()) return markReactionAction(input.actionId.trim());
     const targetKey = normalizeReactionMsgIds(input.targetMsgIds).join('|');
     if (!targetKey) return false;
     const actorKey = input.actorUid?.trim()
