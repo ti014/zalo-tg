@@ -312,7 +312,10 @@ export async function downloadToTemp(
     const filePath = path.join(TMP_DIR, `${Date.now()}_${Math.random().toString(36).slice(2, 7)}_${baseName}`);
     try {
       if (url.startsWith('file:')) {
-        const sourcePath = await realpath(fileURLToPath(new URL(url)));
+        const fileUrl = new URL(url);
+        const sourcePath = await realpath(fileURLToPath(
+          fileUrl.host ? new URL(`file://${fileUrl.pathname}`) : fileUrl,
+        ));
         const sharedRoot = await realpath(getSharedTempRoot());
         const relative = path.relative(sharedRoot, sourcePath);
         if (
@@ -334,6 +337,7 @@ export async function downloadToTemp(
       const resp = await axios.get<NodeJS.ReadableStream>(url, {
         responseType: 'stream',
         timeout: 30_000,
+        family: 4,
         headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ZaloTGBridge/1.0)' },
       });
       const contentLength = Number(resp.headers['content-length']);
