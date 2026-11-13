@@ -1,5 +1,15 @@
 import type { ZaloMediaContent } from './types.js';
-import { truncate } from '../utils/format.js';
+import { escapeHtml, groupCaption, truncate } from '../utils/format.js';
+import { splitZaloText } from '../domain/text-chunks.js';
+
+/** Keep short captions unchanged; send long captions as separate messages, never truncate. */
+export function telegramPhotoCaption(senderName: string, caption = ''): { caption: string; text: string[] } {
+  const prefix = groupCaption(senderName);
+  const full = caption ? `${prefix}\n${escapeHtml(caption)}` : prefix;
+  return full.length <= 1024
+    ? { caption: full, text: [] }
+    : { caption: '', text: splitZaloText(`${senderName}\n${caption}`, [], 4000).map(chunk => chunk.text) };
+}
 
 export interface ZaloLinkContent {
   href: string;

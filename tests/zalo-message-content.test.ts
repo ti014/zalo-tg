@@ -6,7 +6,17 @@ import {
   resolveZaloPhotoContent,
   resolveZaloFallbackDetail,
   resolveZaloTextBody,
+  telegramPhotoCaption,
 } from '../src/zalo/message-content.js';
+
+test('long photo captions preserve complete text outside the Telegram caption limit', () => {
+  assert.deepEqual(telegramPhotoCaption('Sender', '<short>').text, []);
+  const body = 'Tiếng Việt <&> 👩‍💻 '.repeat(500);
+  const result = telegramPhotoCaption('Sender', body);
+  assert.equal(result.caption, '');
+  assert.equal(result.text.join(''), `Sender\n${body}`);
+  assert.ok(result.text.every(text => text.length <= 4000));
+});
 
 test('Zalo link content prefers canonical href and title', () => {
   assert.deepEqual(resolveZaloLinkContent({

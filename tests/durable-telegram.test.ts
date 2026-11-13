@@ -282,6 +282,35 @@ test('worker classifies uncertain outcome and an unhandled replay explicitly', a
     });
   });
 
+  await t.test('handled connect-phase failure becomes RETRY even past maxAttempts', async () => {
+    await withDatabase(async (db, repository) => {
+      const bot = {
+        handleUpdate: async () => {
+          markDurableTelegramHandled();
+          recordDurableTelegramFailure(Object.assign(
+            new Error('connect ETIMEDOUT 10.0.0.1:443'),
+            { code: 'ETIMEDOUT', syscall: 'connect' },
+          ));
+        },
+      } as unknown as Telegraf;
+      const relay = new DurableTelegramRelay({
+        repository,
+        bot,
+        telegramChatId: TELEGRAM_CHAT_ID,
+        getApi: () => ({}) as ZaloAPI,
+        getTopic: () => TOPIC,
+        onFatal: error => { throw error; },
+        pollIntervalMs: 10,
+        maxAttempts: 1,
+      });
+
+      await relay.middleware()(contextFor(telegramUpdate(22)), async () => assert.fail('captured inline'));
+      relay.start();
+      await waitFor(() => deliveryStatus(db, 22) === 'RETRY');
+      await relay.stop();
+    });
+  });
+
   await t.test('replay that reaches no relay handler becomes PERMANENT_FAILED', async () => {
     await withDatabase(async (db, repository) => {
       const relay = new DurableTelegramRelay({

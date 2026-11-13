@@ -1334,6 +1334,18 @@ export class DeliveryRepository {
     return rows.map(toDeliveryRecord);
   }
 
+  /** Deliveries that became UNKNOWN after `since`; only UNKNOWN blocks later FIFO deliveries. */
+  listUnknownSince(since: number, limit = 50): DeliveryRecord[] {
+    requireTimestamp(since, 'since');
+    const rows = this.db.prepare(`
+      ${DELIVERY_SELECT}
+      WHERE d.status = 'UNKNOWN' AND d.updated_at > ?
+      ORDER BY d.updated_at, d.id
+      LIMIT ?
+    `).all(since, limit) as RawDeliveryRow[];
+    return rows.map(toDeliveryRecord);
+  }
+
   problemCount(): number {
     const row = this.db.prepare(`
       SELECT count(*) AS count

@@ -394,6 +394,8 @@ test('operator can inspect and resolve UNKNOWN without leaving FIFO blocked fore
     assert.equal(repository.listProblems()[0]?.id, first.delivery.id);
     assert.equal(repository.problemCount(), 1);
     assert.equal(repository.statusCounts().find(row => row.status === 'UNKNOWN')?.count, 1);
+    assert.deepEqual(repository.listUnknownSince(0).map(row => row.id), [first.delivery.id]);
+    assert.deepEqual(repository.listUnknownSince(101), []);
 
     db.prepare(`
       INSERT INTO media_objects(
