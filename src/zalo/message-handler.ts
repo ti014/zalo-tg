@@ -76,6 +76,7 @@ import {
 } from './message-content.js';
 import { maybeAutoReply } from './auto-reply.js';
 import { parseDeletedZaloMessages, parseEcard, parseMissedCall } from './system-events.js';
+import { fetchEcardReminderTitle, parseEcardReminderRef } from './reminder.js';
 import {
   sendTelegramAnimationWithFallback,
   sendTelegramPhotoWithFallback,
@@ -1084,36 +1085,28 @@ export async function handleZaloMessage(
 
       if (msgType === ZALO_MSG_TYPES.ECARD) {
         const ecard = parseEcard(media);
-        const lines: string[] = [groupCaption(senderName)];
-        lines.push(`🎂 <b>${escapeHtml(ecard.title)}</b>`);
-        if (ecard.description && ecard.description !== ecard.title) {
-          lines.push(escapeHtml(ecard.description));
+        const reference = parseEcardReminderRef(media.params);
+        let title = ecard.title;
+        if (reference) {
+          try { title = await fetchEcardReminderTitle(api, reference, zaloId) ?? title; } catch { /* retain e-card fallback */ }
         }
+        const lines: string[] = [groupCaption(senderName), `🎂 <b>${escapeHtml(title)}</b>`];
+        if (ecard.description && ecard.description !== ecard.title) lines.push(escapeHtml(ecard.description));
         if (ecard.notification) lines.push(`<i>${escapeHtml(ecard.notification)}</i>`);
         const caption = lines.join('\n');
-        if (ecard.imageUrl) {
+        if (ecard.imageUrl && caption.length <= 1024) {
           try {
             const localPath = await downloadZaloMediaDurably(ecard.imageUrl, `ecard_${Date.now()}.png`);
             try {
               const sent = await sendTelegramPhotoFile(
-                localPath,
-                { ...tgBase, caption, parse_mode: 'HTML' },
-                'E-card upload',
+                localPath, { ...tgBase, caption, parse_mode: 'HTML' }, 'E-card upload',
               );
               saveTgMapping(sent);
-            } finally {
-              await cleanTemp(localPath);
-            }
+            } finally { await cleanTemp(localPath); }
             return;
-          } catch (error) {
-            if (isAmbiguousProviderFailure(error)) throw error;
-          }
+          } catch (error) { if (isAmbiguousProviderFailure(error)) throw error; }
         }
-        const sent = await tg.sendMessage(
-          config.telegram.groupId,
-          caption,
-          { ...tgBase, parse_mode: 'HTML' },
-        );
+        const sent = await tg.sendMessage(config.telegram.groupId, caption, { ...tgBase, parse_mode: 'HTML' });
         saveTgMapping(sent);
         return;
       }

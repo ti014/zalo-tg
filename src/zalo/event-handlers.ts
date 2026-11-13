@@ -143,12 +143,14 @@ export function registerZaloEventHandlers(api: ZaloAPI): void {
 
       const rawName = typeof data?.dName === 'string' ? data.dName.trim() : '';
       const actorUid = typeof data?.uidFrom === 'string' ? data.uidFrom.trim() : '';
+      const actionId = typeof data?.actionId === 'string' ? data.actionId.trim() : '';
       if (reactionEventDedupeStore.isDuplicateZaloInbound({
         zaloId,
         targetMsgIds,
         icon: rIcon,
         ...(actorUid ? { actorUid } : {}),
         ...(rawName ? { actorName: rawName } : {}),
+        ...(actionId ? { actionId } : {}),
       })) {
         console.log(`[ZaloHandler] Reaction: skip duplicate ${zaloId}/${targetMsgIds.join('|')}/${rIcon}`);
         return;

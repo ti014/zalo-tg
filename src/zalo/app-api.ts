@@ -104,6 +104,7 @@ async function encryptedPost<T>(
           Cookie: cookieHeader(appSession.cookies, url),
         },
         timeout: 15_000,
+        family: 4,
       },
     );
     if (response.data.error_code !== 0 || !response.data.data) return null;

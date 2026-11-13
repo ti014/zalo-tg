@@ -55,6 +55,10 @@ test('local Bot API file URLs are copied only from the configured shared root', 
   try {
     copied = await downloadToTemp(pathToFileURL(source).toString(), 'tệp Unicode.bin', 1, 100);
     assert.equal(readFileSync(copied, 'utf8'), 'telegram-file');
+    const hostedUrl = `file://telegram-bot-api${source}`;
+    const hostedCopy = await downloadToTemp(hostedUrl, 'hosted.bin', 1, 100);
+    assert.equal(readFileSync(hostedCopy, 'utf8'), 'telegram-file');
+    await cleanTemp(hostedCopy);
     await assert.rejects(
       downloadToTemp(pathToFileURL(forbidden).toString(), 'forbidden.bin', 1, 100),
       /outside the configured shared temp root/,
