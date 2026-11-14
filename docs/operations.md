@@ -238,7 +238,7 @@ Chính sách được owner chọn ngày 2026-11-13: chiều **Zalo → Telegram
 
 Không tự replay nếu delivery có receipt từ bất kỳ attempt nào, multipart part còn `UNKNOWN`/`SENDING`, hoặc lỗi `PARTIAL_CHUNK_UPLOAD`, `MULTIPART_PART_UNKNOWN`, `RECEIPT_WRITE_FAILED`, `SHADOW_WRITE_FAILED`: các trường hợp này vẫn vào `UNKNOWN` để tránh gửi lại toàn bộ một thao tác đã thực hiện một phần. Lease hết hạn sau crash và lỗi mơ hồ chiều Telegram → Zalo cũng vẫn cần đối soát. Lỗi connect chưa tới provider được retry ở cả hai chiều.
 
-Nhánh fallback định dạng (ví dụ sticker sang photo) vẫn dừng ở lỗi transport để không đổi định dạng chỉ vì mạng lỗi. Khi khởi động và mỗi giờ sau đó, bridge gửi vào `TG_GROUP_ID` danh sách delivery `UNKNOWN` mới, kèm tên topic và lệnh `/queue detail <delivery-id>`. Quy trình reconciliation (đối soát) là:
+Nhánh fallback định dạng (ví dụ sticker sang photo) vẫn dừng ở lỗi transport để không đổi định dạng chỉ vì mạng lỗi. Sau khi Telegram ready và mỗi 60 giây, bridge kiểm tra tối đa 50 delivery `UNKNOWN` mới, kèm tên topic và lệnh `/queue detail <delivery-id>`. Cursor `(updated_at, id)` giữ đủ các delivery trùng timestamp; thông báo tự chia dưới giới hạn 4096 ký tự và chỉ tiến cursor sau khi gửi thành công. Backlog trên 50 bản ghi được báo ở các chu kỳ tiếp theo. Cursor lưu RAM nên các lỗi còn mở sẽ được báo lại sau restart. Quy trình reconciliation (đối soát) là:
 
 1. Dùng thông tin conversation và thời điểm trong log để kiểm tra thủ công ở destination.
 2. Nếu tin nhắn đã xuất hiện, xác nhận đã gửi:

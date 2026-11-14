@@ -50,6 +50,14 @@ test('reaction action IDs preserve repeated taps and dedupe replayed events', ()
   assert.equal(reactionSummaryStore.buildText(entry), '❤️ ×2 Alice  👍 Bob');
 });
 
+test('reaction summaries escape untrusted HTML once without changing counts', () => {
+  const entry = reactionSummaryStore.upsert(987655, '<icon>&', 'Alice <ops> & Bob');
+  reactionSummaryStore.upsert(987655, '<icon>&', 'Alice <ops> & Bob');
+  const expected = '&lt;icon&gt;&amp; ×2 Alice &lt;ops&gt; &amp; Bob';
+  assert.equal(reactionSummaryStore.buildText(entry), expected);
+  assert.equal(reactionSummaryStore.buildText(entry), expected);
+});
+
 test('reaction event dedupe recognizes equivalent target ordering', () => {
   const unique = `conversation-${process.pid}-${Date.now()}`;
   const input = {

@@ -383,6 +383,23 @@ test('retention purges only old SENT and SKIPPED deliveries', () => {
   });
 });
 
+test('UNKNOWN cursor visits more than fifty rows sharing the same timestamp', () => {
+  withRepository(repository => {
+    for (let i = 0; i < 55; i += 1) {
+      const queued = enqueue(repository, `cursor-${i}`, `conversation-${i}`);
+      assert.equal(repository.leaseNext('zalo', 'worker', 100, 50)?.id, queued.delivery.id);
+      repository.markUnknown(queued.delivery.id, 'worker', 101, { code: 'TIMEOUT' });
+    }
+    const first = repository.listUnknownAfter({ updatedAt: 0, id: '' });
+    assert.equal(first.length, 50);
+    const last = first[first.length - 1]!;
+    const second = repository.listUnknownAfter({ updatedAt: last.updatedAt, id: last.id });
+    assert.equal(second.length, 5);
+    assert.equal(new Set([...first, ...second].map(row => row.id)).size, 55);
+    assert.throws(() => repository.listUnknownAfter({ updatedAt: 0, id: '' }, 0), /limit/);
+  });
+});
+
 test('operator can inspect and resolve UNKNOWN without leaving FIFO blocked forever', () => {
   withRepository((repository, _databasePath, db) => {
     const first = enqueue(repository, 'update:unknown-operator', 'friend:operator', 100);
@@ -394,8 +411,8 @@ test('operator can inspect and resolve UNKNOWN without leaving FIFO blocked fore
     assert.equal(repository.listProblems()[0]?.id, first.delivery.id);
     assert.equal(repository.problemCount(), 1);
     assert.equal(repository.statusCounts().find(row => row.status === 'UNKNOWN')?.count, 1);
-    assert.deepEqual(repository.listUnknownSince(0).map(row => row.id), [first.delivery.id]);
-    assert.deepEqual(repository.listUnknownSince(101), []);
+    assert.deepEqual(repository.listUnknownAfter({ updatedAt: 0, id: '' }).map(row => row.id), [first.delivery.id]);
+    assert.deepEqual(repository.listUnknownAfter({ updatedAt: 101, id: first.delivery.id }), []);
 
     db.prepare(`
       INSERT INTO media_objects(

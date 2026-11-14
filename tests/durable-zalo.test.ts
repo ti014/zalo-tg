@@ -23,6 +23,7 @@ import {
   type DeliveryStatus,
 } from '../src/infrastructure/database/delivery-repository.js';
 import type { ZaloAPI, ZaloMessage } from '../src/zalo/types.js';
+import { fetchEcardReminderTitle } from '../src/zalo/reminder.js';
 
 const api = {} as ZaloAPI;
 
@@ -429,6 +430,37 @@ test('delivery failures transition to retry, unknown, permanent failure, or DLQ'
   });
   assert.equal(dlq.status, 'DLQ');
   assert.equal(dlq.lastErrorCode, 'MAX_ATTEMPTS');
+});
+
+test('hung reminder enrichment falls back and releases the worker for another conversation', async () => {
+  await withRepository(async (repository, db) => {
+    const first = zaloMessage('hung-reminder', 'conversation-a');
+    const second = zaloMessage('plain-text', 'conversation-b');
+    const processed: string[] = [];
+    let reads = 0;
+    const reminderApi = {
+      getReminder: () => { reads += 1; return new Promise(() => undefined); },
+    } as ZaloAPI;
+    const relay = new DurableZaloRelay({
+      repository,
+      processMessage: async (_api, message) => {
+        markDurableZaloHandled();
+        if (message.data.msgId === first.data.msgId) {
+          assert.equal(await fetchEcardReminderTitle(reminderApi, { kind: 'group', topicId: 'g' }, 'a', 30), undefined);
+        }
+        processed.push(message.data.msgId);
+      },
+      onFatal: error => assert.fail(error),
+    });
+    try {
+      relay.enqueue(first);
+      relay.enqueue(second);
+      relay.setApi(api);
+      await waitFor(() => findDelivery(repository, db, second).status === 'SENT', 'next conversation after reminder deadline');
+      assert.equal(reads, 1);
+      assert.deepEqual(processed, ['hung-reminder', 'plain-text']);
+    } finally { await relay.stop(); }
+  });
 });
 
 test('transport retries preserve FIFO and resume after a simulated restart', async () => {
