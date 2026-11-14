@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto';
 
 import type { BridgeDatabase } from './database.js';
 
+export interface UnknownDeliveryCursor {
+  updatedAt: number;
+  id: string;
+}
+
 export type DeliverySource = 'telegram' | 'zalo';
 export type DeliveryDestination = 'telegram' | 'zalo';
 export type DeliveryStatus =
@@ -1334,15 +1339,20 @@ export class DeliveryRepository {
     return rows.map(toDeliveryRecord);
   }
 
-  /** Deliveries that became UNKNOWN after `since`; only UNKNOWN blocks later FIFO deliveries. */
-  listUnknownSince(since: number, limit = 50): DeliveryRecord[] {
-    requireTimestamp(since, 'since');
+  /** Stable pagination includes every UNKNOWN delivery sharing a timestamp. */
+  listUnknownAfter(cursor: UnknownDeliveryCursor, limit = 50): DeliveryRecord[] {
+    requireTimestamp(cursor.updatedAt, 'cursor.updatedAt');
+    if (typeof cursor.id !== 'string') throw new Error('cursor.id must be a string.');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new Error('limit must be a safe integer between 1 and 100.');
+    }
     const rows = this.db.prepare(`
       ${DELIVERY_SELECT}
-      WHERE d.status = 'UNKNOWN' AND d.updated_at > ?
+      WHERE d.status = 'UNKNOWN'
+        AND (d.updated_at > ? OR (d.updated_at = ? AND d.id > ?))
       ORDER BY d.updated_at, d.id
       LIMIT ?
-    `).all(since, limit) as RawDeliveryRow[];
+    `).all(cursor.updatedAt, cursor.updatedAt, cursor.id, limit) as RawDeliveryRow[];
     return rows.map(toDeliveryRecord);
   }
 

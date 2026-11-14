@@ -20,7 +20,9 @@ const {
 
 test('shared temp user token survives unavailable OS account metadata', () => {
   assert.equal(currentUserToken(() => 10001, () => 'ignored'), '10001');
-  assert.equal(currentUserToken(undefined, () => { throw new Error('no user database'); }), 'user');
+  const noUid = () => { throw new Error('UID unavailable'); };
+  assert.equal(currentUserToken(noUid, () => 'fallback user'), 'fallback-user');
+  assert.equal(currentUserToken(noUid, () => { throw new Error('no user database'); }), 'user');
 });
 
 test('shared temp paths are writable-root scoped and unique per operation', () => {

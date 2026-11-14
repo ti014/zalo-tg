@@ -1,3 +1,5 @@
+import { escapeHtml } from '../utils/format.js';
+
 export interface ReactionSummaryEntry {
   summaryTgMsgId: number | null;
   lastSentText: string;
@@ -27,7 +29,7 @@ export const reactionSummaryStore = {
   buildText(entry: ReactionSummaryEntry): string {
     return Object.entries(entry.reactions)
       .flatMap(([emoji, actors]) => Object.entries(actors)
-        .map(([name, count]) => count > 1 ? `${emoji} ×${count} ${name}` : `${emoji} ${name}`))
+        .map(([name, count]) => `${escapeHtml(emoji)}${count > 1 ? ` ×${count}` : ''} ${escapeHtml(name)}`))
       .join('  ');
   },
 

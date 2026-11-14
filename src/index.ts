@@ -39,6 +39,7 @@ import type { MappingClearPreparation } from './telegram/types.js';
 import { reconcileGroupTopics } from './zalo/topic-reconciliation.js';
 import { requestRecentHistoryReplay } from './zalo/history.js';
 import { waitForZaloListenerConnection } from './zalo/listener-lifecycle.js';
+import { createUnknownDeliveryCheck } from './application/unknown-delivery-alerts.js';
 
 installConsoleRedaction([config.telegram.token]);
 
@@ -61,30 +62,24 @@ let mappingClearReserved = false;
 const MEDIA_MAINTENANCE_INTERVAL_MS = 60 * 60_000;
 const TOPIC_RECONCILIATION_INTERVAL_MS = 30 * 60_000;
 
-// Starts at 0 so every boot re-announces UNKNOWN deliveries that are still blocking.
-let unknownAlertWatermark = 0;
-let unknownAlertInFlight = false;
+let unknownAlertTimer: ReturnType<typeof setInterval> | undefined;
 
-function alertNewUnknownDeliveries(deliveryRepository: DeliveryRepository): void {
-  if (unknownAlertInFlight) return;
-  const fresh = deliveryRepository.listUnknownSince(unknownAlertWatermark);
-  if (fresh.length === 0) return;
-  const lines = fresh.map(delivery => {
-    const separator = delivery.conversationKey.indexOf(':');
-    const type = Number(delivery.conversationKey.slice(0, separator)) as 0 | 1;
-    const topicId = store.getTopicByZalo(delivery.conversationKey.slice(separator + 1), type);
-    const name = topicId === undefined ? undefined : store.getEntryByTopic(topicId)?.name;
-    return `${delivery.destination === 'telegram' ? 'Zalo→TG' : 'TG→Zalo'} `
-      + `${name ?? delivery.conversationKey}: /queue detail ${delivery.id}`;
-  });
-  const text = 'Delivery UNKNOWN đang chặn các tin phía sau trong cùng hội thoại:\n'
-    + `${lines.join('\n')}\n`
-    + 'Kiểm tra đích rồi dùng /queue sent|retry|dlq <delivery-id>.';
-  unknownAlertInFlight = true;
-  tgBot.telegram.sendMessage(config.telegram.groupId, text)
-    .then(() => { unknownAlertWatermark = fresh[fresh.length - 1]!.updatedAt; })
-    .catch(error => console.warn('[Delivery] UNKNOWN alert failed:', error))
-    .finally(() => { unknownAlertInFlight = false; });
+function startUnknownDeliveryAlerts(repository: DeliveryRepository): void {
+  const check = createUnknownDeliveryCheck(
+    repository,
+    text => tgBot.telegram.sendMessage(config.telegram.groupId, text),
+    delivery => {
+      const separator = delivery.conversationKey.indexOf(':');
+      const type = Number(delivery.conversationKey.slice(0, separator)) as 0 | 1;
+      const topicId = store.getTopicByZalo(delivery.conversationKey.slice(separator + 1), type);
+      return (topicId === undefined ? undefined : store.getEntryByTopic(topicId)?.name)
+        ?? delivery.conversationKey;
+    },
+  );
+  const run = () => { void check().catch(error => console.warn('[Delivery] UNKNOWN alert failed:', error)); };
+  run();
+  unknownAlertTimer = setInterval(run, 60_000);
+  unknownAlertTimer.unref();
 }
 
 const startedZaloListeners = new WeakSet<object>();
@@ -146,7 +141,6 @@ function startMediaMaintenance(
       const purged = deliveryRepository.purgeTerminalBefore(
         Date.now() - config.delivery.sentRetentionMs,
       );
-      alertNewUnknownDeliveries(deliveryRepository);
       const filesystem = statfsSync(config.dataDir);
       const freeBytes = filesystem.bavail * filesystem.bsize;
       const storageHealth = freeBytes < config.storage.minFreeBytes
@@ -219,6 +213,8 @@ async function shutdown(
   clearReconnectTimer();
   clearMediaMaintenanceTimer();
   clearTopicReconciliationTimer();
+  if (unknownAlertTimer) clearInterval(unknownAlertTimer);
+  unknownAlertTimer = undefined;
   updateChecker?.stop();
   const apiAtShutdown = activeZaloApi;
   telegramHandler?.clearApi(apiAtShutdown ?? undefined);
@@ -542,6 +538,7 @@ async function main(): Promise<void> {
   console.log('[Boot] Telegram bot started ✓');
   await syncTelegramCommands();
   runtimeHealth.set('telegram', 'ready');
+  startUnknownDeliveryAlerts(deliveryRepository);
   console.log('[Boot] Telegram command menu synced ✓');
   console.log('[Boot] Bridge is running (Ctrl+C to stop)');
   if (config.runtime.updateCheckerEnabled) updateChecker = startUpdateChecker(tgBot);
